@@ -146,6 +146,11 @@ fn build_api_routes() -> Router<AppState> {
             axum::routing::post(moltis_gateway::tools_routes::restart),
         )
         .route("/api/sessions", get(api::api_sessions_handler))
+        .route("/api/nodamem/graph", get(api::api_nodamem_graph_handler))
+        .route(
+            "/api/nodamem/graph/nodes/{node_id}",
+            get(api::api_nodamem_graph_node_handler),
+        )
         .route(
             "/api/sessions/{session_key}/history",
             get(api::api_session_history_handler),
