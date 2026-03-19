@@ -107,6 +107,10 @@ impl ChatRuntime for GatewayChatRuntime {
         self.state.memory_manager.as_ref()
     }
 
+    fn nodamem(&self) -> Option<&Arc<moltis_nodamem_adapter::NodamemAdapter>> {
+        self.state.nodamem.as_ref()
+    }
+
     // ── Cached location ─────────────────────────────────────────────────────
 
     async fn cached_location(&self) -> Option<moltis_config::GeoLocation> {
