@@ -16,6 +16,7 @@ use {
     memory_store::{StoreConfig, StoreRuntime},
     tokio::sync::Mutex,
     tracing::{debug, info, warn},
+    uuid::Uuid,
 };
 
 #[derive(Debug)]
@@ -126,6 +127,84 @@ impl Default for PromptImaginationFormatConfig {
             max_outcomes_per_scenario: 2,
             include_strategy_continuity: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectionConfig {
+    pub max_nodes: usize,
+    pub max_lessons: usize,
+    pub max_scenarios: usize,
+    pub max_trait_events: usize,
+    pub max_history_nodes: usize,
+}
+
+impl Default for InspectionConfig {
+    fn default() -> Self {
+        Self {
+            max_nodes: 4,
+            max_lessons: 3,
+            max_scenarios: 2,
+            max_trait_events: 4,
+            max_history_nodes: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInspectionReport {
+    pub verified_packet_view: String,
+    pub hypothetical_scenarios_view: String,
+    pub self_model_continuity_view: String,
+    pub trait_update_reasons_view: String,
+    pub lesson_reasons_view: String,
+    pub superseded_history_view: String,
+}
+
+impl MemoryInspectionReport {
+    #[must_use]
+    pub fn render(&self) -> String {
+        [
+            self.verified_packet_view.as_str(),
+            self.hypothetical_scenarios_view.as_str(),
+            self.self_model_continuity_view.as_str(),
+            self.trait_update_reasons_view.as_str(),
+            self.lesson_reasons_view.as_str(),
+            self.superseded_history_view.as_str(),
+        ]
+        .join("\n\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationScenarioResult {
+    pub name: &'static str,
+    pub passed: bool,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationHarnessReport {
+    pub scenarios: Vec<EvaluationScenarioResult>,
+}
+
+impl EvaluationHarnessReport {
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut lines = vec!["## Nodamem Evaluation".to_owned()];
+        for scenario in &self.scenarios {
+            lines.push(format!(
+                "- {} [{}]: {}",
+                scenario.name,
+                if scenario.passed {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                scenario.details
+            ));
+        }
+        lines.join("\n")
     }
 }
 
@@ -481,7 +560,7 @@ impl NodamemAdapter {
         let mut missing_count = 0;
 
         for scenario_id in &request.scenario_ids {
-            let Ok(parsed) = uuid::Uuid::parse_str(scenario_id) else {
+            let Ok(parsed) = Uuid::parse_str(scenario_id) else {
                 missing_count += 1;
                 continue;
             };
@@ -512,6 +591,85 @@ impl NodamemAdapter {
             missing_count,
         })
     }
+
+    pub async fn inspect_memory_flow(
+        &self,
+        request: &RecallRequest,
+        config: InspectionConfig,
+    ) -> anyhow::Result<MemoryInspectionReport> {
+        let recall = self.recall_context(request).await?;
+        let runtime = self.runtime.lock().await;
+        let repository = runtime.repository();
+        let self_model = repository.load_latest_self_model().await?;
+        let trait_events = repository
+            .load_trait_events(None, Some(config.max_trait_events))
+            .await?;
+        let lessons = repository.list_lessons().await?;
+        let nodes = repository.list_nodes().await?;
+
+        let report = MemoryInspectionReport {
+            verified_packet_view: render_verified_packet_view(recall.as_ref(), config),
+            hypothetical_scenarios_view: render_hypothetical_scenarios_view(
+                recall.as_ref(),
+                &repository,
+                config,
+            )
+            .await?,
+            self_model_continuity_view: render_self_model_continuity_view(self_model.as_ref()),
+            trait_update_reasons_view: render_trait_update_reasons_view(&trait_events),
+            lesson_reasons_view: render_lesson_reasons_view(&repository, &lessons, config).await?,
+            superseded_history_view: render_superseded_history_view(&nodes, config),
+        };
+
+        debug!(
+            has_verified_packet = recall.is_some(),
+            trait_event_count = trait_events.len(),
+            lesson_count = lessons.len(),
+            node_count = nodes.len(),
+            "nodamem inspection report generated"
+        );
+
+        Ok(report)
+    }
+
+    pub async fn run_evaluation_harness_at(
+        path: PathBuf,
+    ) -> anyhow::Result<EvaluationHarnessReport> {
+        let adapter = NodamemAdapter::open_at(path).await?;
+        let mut scenarios = Vec::new();
+
+        scenarios.push(
+            evaluate_stable_preference_recall(&adapter)
+                .await
+                .unwrap_or_else(evaluation_failure("stable preference recall")),
+        );
+        scenarios.push(
+            evaluate_contradiction_handling(&adapter)
+                .await
+                .unwrap_or_else(evaluation_failure("contradiction handling")),
+        );
+        scenarios.push(
+            evaluate_duplicate_suppression(&adapter)
+                .await
+                .unwrap_or_else(evaluation_failure("duplicate suppression")),
+        );
+        scenarios.push(
+            evaluate_grounded_imagination(&adapter)
+                .await
+                .unwrap_or_else(evaluation_failure("grounded imagination")),
+        );
+        scenarios.push(
+            evaluate_scenario_feedback_review(&adapter)
+                .await
+                .unwrap_or_else(evaluation_failure("scenario feedback review")),
+        );
+
+        debug!(
+            scenario_count = scenarios.len(),
+            "nodamem evaluation harness completed"
+        );
+        Ok(EvaluationHarnessReport { scenarios })
+    }
 }
 
 async fn load_snapshot(runtime: &StoreRuntime) -> anyhow::Result<StoreSnapshot> {
@@ -522,6 +680,366 @@ async fn load_snapshot(runtime: &StoreRuntime) -> anyhow::Result<StoreSnapshot> 
         checkpoints: runtime.repository().load_recent_checkpoints(3).await?,
         traits: runtime.repository().list_trait_states().await?,
         self_model_snapshot: runtime.repository().load_latest_self_model().await?,
+    })
+}
+
+fn render_verified_packet_view(recall: Option<&RecallResult>, config: InspectionConfig) -> String {
+    let mut lines = vec!["## Verified Packet".to_owned()];
+    let Some(recall) = recall else {
+        lines.push("No verified packet available.".to_owned());
+        return lines.join("\n");
+    };
+
+    lines.push(format!(
+        "nodes={} lessons={} checkpoints={} traits={}",
+        recall.packet.nodes.len(),
+        recall.packet.lessons.len(),
+        recall.packet.checkpoints.len(),
+        recall.packet.traits.len()
+    ));
+    for node in recall.packet.nodes.iter().take(config.max_nodes) {
+        lines.push(format!(
+            "- {:?}: {}",
+            node.node_type,
+            truncate_line(&format_memory_line(&node.title, &node.summary), 96)
+        ));
+    }
+    for lesson in recall.packet.lessons.iter().take(config.max_lessons) {
+        lines.push(format!(
+            "- lesson: {}",
+            truncate_line(&format!("{}: {}", lesson.title, lesson.statement), 96)
+        ));
+    }
+    lines.join("\n")
+}
+
+async fn render_hypothetical_scenarios_view(
+    recall: Option<&RecallResult>,
+    repository: &memory_store::StoreRepository<'_>,
+    config: InspectionConfig,
+) -> anyhow::Result<String> {
+    let mut lines = vec!["## Hypothetical Scenarios".to_owned()];
+    let Some(recall) = recall else {
+        lines.push("No scenarios requested.".to_owned());
+        return Ok(lines.join("\n"));
+    };
+    if recall.imagined_scenario_ids.is_empty() {
+        lines.push("No hypothetical scenarios attached.".to_owned());
+        return Ok(lines.join("\n"));
+    }
+
+    for scenario_id in recall
+        .imagined_scenario_ids
+        .iter()
+        .take(config.max_scenarios)
+    {
+        let parsed = Uuid::parse_str(scenario_id)?;
+        if let Some(scenario) = repository
+            .load_imagined_scenario(memory_core::ScenarioId(parsed))
+            .await?
+        {
+            lines.push(format!(
+                "- {} [{} | {:?}]",
+                truncate_line(&scenario.title, 60),
+                imagination_kind_label(scenario.kind),
+                scenario.status
+            ));
+            lines.push(format!(
+                "  basis={} outcomes={}",
+                scenario.basis_source_node_ids.len(),
+                scenario.predicted_outcomes.len()
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_self_model_continuity_view(self_model: Option<&memory_core::SelfModel>) -> String {
+    let mut lines = vec!["## Self-Model Continuity".to_owned()];
+    let Some(self_model) = self_model else {
+        lines.push("No self-model snapshot available.".to_owned());
+        return lines.join("\n");
+    };
+
+    let continuity = summarize_self_model_for_strategy(Some(self_model))
+        .unwrap_or_else(|| "No compact continuity line available.".to_owned());
+    lines.push(format!("line: {continuity}"));
+    lines.push(format!(
+        "source: strengths={} preferences={} tendencies={} domains={}",
+        self_model.recurring_strengths.len(),
+        self_model.user_interaction_preferences.len(),
+        self_model.behavioral_tendencies.len(),
+        self_model.active_domains.len()
+    ));
+    lines.join("\n")
+}
+
+fn render_trait_update_reasons_view(trait_events: &[memory_core::TraitEvent]) -> String {
+    let mut lines = vec!["## Trait Update Reasons".to_owned()];
+    if trait_events.is_empty() {
+        lines.push("No trait updates recorded.".to_owned());
+        return lines.join("\n");
+    }
+    for event in trait_events {
+        lines.push(format!(
+            "- {} {:?} {:.2}->{:.2}: {}",
+            trait_type_label(event.trait_type),
+            event.change_kind,
+            event.previous_strength,
+            event.updated_strength,
+            truncate_line(&event.reason, 84)
+        ));
+    }
+    lines.join("\n")
+}
+
+async fn render_lesson_reasons_view(
+    repository: &memory_store::StoreRepository<'_>,
+    lessons: &[memory_core::Lesson],
+    config: InspectionConfig,
+) -> anyhow::Result<String> {
+    let mut lines = vec!["## Lesson Reasons".to_owned()];
+    if lessons.is_empty() {
+        lines.push("No lessons available.".to_owned());
+        return Ok(lines.join("\n"));
+    }
+    for lesson in lessons.iter().take(config.max_lessons) {
+        if let Some(audit) = repository.inspect_lesson_audit(lesson.id).await? {
+            lines.push(format!(
+                "- {}: {}",
+                truncate_line(&audit.lesson.title, 40),
+                audit
+                    .reasons
+                    .iter()
+                    .take(2)
+                    .map(|value| truncate_line(value, 60))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_superseded_history_view(nodes: &[Node], config: InspectionConfig) -> String {
+    let mut lines = vec!["## Superseded Preferences And Goals".to_owned()];
+    let relevant = nodes
+        .iter()
+        .filter(|node| {
+            matches!(node.node_type, NodeType::Preference | NodeType::Goal)
+                && matches!(
+                    node.status,
+                    MemoryStatus::Archived | MemoryStatus::Active | MemoryStatus::Reinforced
+                )
+        })
+        .take(config.max_history_nodes)
+        .collect::<Vec<_>>();
+    if relevant.is_empty() {
+        lines.push("No preference or goal history available.".to_owned());
+        return lines.join("\n");
+    }
+    for node in relevant {
+        lines.push(format!(
+            "- {:?} {:?}: {}",
+            node.node_type,
+            node.status,
+            truncate_line(&format_memory_line(&node.title, &node.summary), 84)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn evaluation_failure(
+    name: &'static str,
+) -> impl FnOnce(anyhow::Error) -> EvaluationScenarioResult {
+    move |error| EvaluationScenarioResult {
+        name,
+        passed: false,
+        details: truncate_line(&format!("error: {error}"), 120),
+    }
+}
+
+async fn evaluate_stable_preference_recall(
+    adapter: &NodamemAdapter,
+) -> anyhow::Result<EvaluationScenarioResult> {
+    adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-pref".to_owned()),
+            user_text: "Remember the user prefers concise answers.".to_owned(),
+            assistant_text: "I will keep future answers concise.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    let recall = adapter
+        .recall_context(&RecallRequest {
+            text: "What tone should I use based on the user's preference?".to_owned(),
+            session_id: Some("eval-pref".to_owned()),
+            topic: Some("preference".to_owned()),
+            include_hypothetical: false,
+        })
+        .await?;
+    let passed = recall
+        .as_ref()
+        .is_some_and(|value| value.prompt_context.to_lowercase().contains("concise"));
+    Ok(EvaluationScenarioResult {
+        name: "stable preference recall",
+        passed,
+        details: if passed {
+            "verified preference was recalled".to_owned()
+        } else {
+            "verified preference was not surfaced".to_owned()
+        },
+    })
+}
+
+async fn evaluate_contradiction_handling(
+    adapter: &NodamemAdapter,
+) -> anyhow::Result<EvaluationScenarioResult> {
+    adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-contradiction".to_owned()),
+            user_text: "Remember the user prefers detailed updates.".to_owned(),
+            assistant_text: "I will use detailed updates.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-contradiction".to_owned()),
+            user_text: "The user now prefers concise updates instead.".to_owned(),
+            assistant_text: "I will use concise updates instead.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    let runtime = adapter.runtime.lock().await;
+    let nodes = runtime.repository().list_nodes().await?;
+    let archived_preferences = nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == NodeType::Preference && node.status == MemoryStatus::Archived
+        })
+        .count();
+    Ok(EvaluationScenarioResult {
+        name: "contradiction handling",
+        passed: archived_preferences >= 1,
+        details: format!("archived_preferences={archived_preferences}"),
+    })
+}
+
+async fn evaluate_duplicate_suppression(
+    adapter: &NodamemAdapter,
+) -> anyhow::Result<EvaluationScenarioResult> {
+    let first = adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-duplicate".to_owned()),
+            user_text: "Remember the deployment window is Friday night.".to_owned(),
+            assistant_text: "The deployment window is Friday night.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    let second = adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-duplicate".to_owned()),
+            user_text: "Remember again that the deployment window is Friday night.".to_owned(),
+            assistant_text: "Still noted: Friday night deployment window.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    Ok(EvaluationScenarioResult {
+        name: "duplicate suppression",
+        passed: second.stored_node_count <= first.stored_node_count,
+        details: format!(
+            "first_stored={} second_stored={}",
+            first.stored_node_count, second.stored_node_count
+        ),
+    })
+}
+
+async fn evaluate_grounded_imagination(
+    adapter: &NodamemAdapter,
+) -> anyhow::Result<EvaluationScenarioResult> {
+    adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-imagination".to_owned()),
+            user_text: "Remember the project goal is to stage the rollout carefully.".to_owned(),
+            assistant_text: "I will plan around a careful staged rollout.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    let recall = adapter
+        .recall_context(&RecallRequest {
+            text: "Brainstorm staged rollout options for next week.".to_owned(),
+            session_id: Some("eval-imagination".to_owned()),
+            topic: Some("planning".to_owned()),
+            include_hypothetical: true,
+        })
+        .await?;
+    let passed = recall.as_ref().is_some_and(|value| {
+        value
+            .hypothetical_prompt_context
+            .as_deref()
+            .is_some_and(|block| block.contains("## Hypothetical Planning Scenarios"))
+    });
+    Ok(EvaluationScenarioResult {
+        name: "grounded imagination",
+        passed,
+        details: if passed {
+            "planning prompt produced hypothetical scenarios".to_owned()
+        } else {
+            "no hypothetical planning block was produced".to_owned()
+        },
+    })
+}
+
+async fn evaluate_scenario_feedback_review(
+    adapter: &NodamemAdapter,
+) -> anyhow::Result<EvaluationScenarioResult> {
+    adapter
+        .propose_memory(&MemoryProposalRequest {
+            session_id: Some("eval-review".to_owned()),
+            user_text: "Remember the current goal is to ship a staged rollout safely.".to_owned(),
+            assistant_text: "I will plan for a safe staged rollout.".to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await?;
+    let recall = adapter
+        .recall_context(&RecallRequest {
+            text: "Plan a rollout fallback for next week.".to_owned(),
+            session_id: Some("eval-review".to_owned()),
+            topic: Some("planning".to_owned()),
+            include_hypothetical: true,
+        })
+        .await?;
+    let Some(recall) = recall else {
+        return Ok(EvaluationScenarioResult {
+            name: "scenario acceptance/rejection feedback",
+            passed: false,
+            details: "no planning scenarios were generated".to_owned(),
+        });
+    };
+    adapter
+        .review_imagined_scenarios(&ImaginedScenarioFeedbackRequest {
+            scenario_ids: recall.imagined_scenario_ids.clone(),
+            accepted: false,
+        })
+        .await?;
+    let runtime = adapter.runtime.lock().await;
+    let mut rejected = 0;
+    for scenario_id in &recall.imagined_scenario_ids {
+        let scenario = runtime
+            .repository()
+            .load_imagined_scenario(memory_core::ScenarioId(Uuid::parse_str(scenario_id)?))
+            .await?;
+        if let Some(scenario) = scenario
+            && scenario.status == memory_core::ImaginationStatus::Rejected
+        {
+            rejected += 1;
+        }
+    }
+    Ok(EvaluationScenarioResult {
+        name: "scenario acceptance/rejection feedback",
+        passed: rejected == recall.imagined_scenario_ids.len() && rejected > 0,
+        details: format!("rejected={rejected}"),
     })
 }
 
@@ -803,6 +1321,19 @@ fn imagination_kind_label(kind: memory_core::ImaginedScenarioKind) -> &'static s
         memory_core::ImaginedScenarioKind::FutureNeedPrediction => "future need",
         memory_core::ImaginedScenarioKind::AlternativePlan => "alternative plan",
         memory_core::ImaginedScenarioKind::Counterfactual => "counterfactual",
+    }
+}
+
+fn trait_type_label(trait_type: memory_core::TraitType) -> &'static str {
+    match trait_type {
+        memory_core::TraitType::Curiosity => "curiosity",
+        memory_core::TraitType::Caution => "caution",
+        memory_core::TraitType::Verbosity => "verbosity",
+        memory_core::TraitType::NoveltySeeking => "novelty_seeking",
+        memory_core::TraitType::EvidenceReliance => "evidence_reliance",
+        memory_core::TraitType::Reliability => "reliability",
+        memory_core::TraitType::Practicality => "practicality",
+        memory_core::TraitType::Proactivity => "proactivity",
     }
 }
 
@@ -1384,6 +1915,114 @@ mod tests {
                 .prompt_context
                 .contains("## Hypothetical Planning Scenarios")
         );
+    }
+
+    #[test]
+    fn inspection_report_render_is_stable_and_compact() {
+        let report = MemoryInspectionReport {
+            verified_packet_view: "## Verified Packet\nnodes=1 lessons=0 checkpoints=0 traits=0"
+                .to_owned(),
+            hypothetical_scenarios_view:
+                "## Hypothetical Scenarios\nNo hypothetical scenarios attached.".to_owned(),
+            self_model_continuity_view:
+                "## Self-Model Continuity\nline: practical release planning".to_owned(),
+            trait_update_reasons_view: "## Trait Update Reasons\nNo trait updates recorded."
+                .to_owned(),
+            lesson_reasons_view: "## Lesson Reasons\nNo lessons available.".to_owned(),
+            superseded_history_view:
+                "## Superseded Preferences And Goals\nNo preference or goal history available."
+                    .to_owned(),
+        };
+
+        let rendered = report.render();
+        assert!(rendered.contains("## Verified Packet"));
+        assert!(rendered.contains("## Self-Model Continuity"));
+        assert!(rendered.contains("## Superseded Preferences And Goals"));
+        assert!(rendered.lines().count() <= 20);
+    }
+
+    #[test]
+    fn evaluation_report_render_is_stable() {
+        let report = EvaluationHarnessReport {
+            scenarios: vec![
+                EvaluationScenarioResult {
+                    name: "stable preference recall",
+                    passed: true,
+                    details: "verified preference was recalled".to_owned(),
+                },
+                EvaluationScenarioResult {
+                    name: "grounded imagination",
+                    passed: false,
+                    details: "no hypothetical planning block was produced".to_owned(),
+                },
+            ],
+        };
+
+        let rendered = report.render();
+        assert!(rendered.starts_with("## Nodamem Evaluation"));
+        assert!(rendered.contains("- stable preference recall [pass]:"));
+        assert!(rendered.contains("- grounded imagination [fail]:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inspection_report_captures_memory_and_reason_views() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("inspect-session".to_owned()),
+                user_text: "Remember the user prefers concise deployment updates.".to_owned(),
+                assistant_text: "I will keep deployment updates concise.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+        let _ = adapter
+            .record_outcome(&OutcomeFeedbackRequest {
+                outcome_id: Uuid::new_v4().to_string(),
+                subject_node_id: None,
+                success: true,
+                usefulness: 0.8,
+                prediction_correct: true,
+                user_accepted: true,
+                validated: true,
+            })
+            .await
+            .expect("outcome should succeed");
+
+        let report = adapter
+            .inspect_memory_flow(
+                &RecallRequest {
+                    text: "What preference should guide the update?".to_owned(),
+                    session_id: Some("inspect-session".to_owned()),
+                    topic: Some("preference".to_owned()),
+                    include_hypothetical: false,
+                },
+                InspectionConfig::default(),
+            )
+            .await
+            .expect("inspection should succeed");
+
+        let rendered = report.render();
+        assert!(rendered.contains("## Verified Packet"));
+        assert!(rendered.contains("## Trait Update Reasons"));
+        assert!(rendered.contains("## Self-Model Continuity"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluation_harness_runs_repeatable_scenarios() {
+        let dir = tempfile::tempdir().expect("tempdir should exist");
+        let report = NodamemAdapter::run_evaluation_harness_at(dir.path().join("eval.db"))
+            .await
+            .expect("evaluation harness should succeed");
+
+        assert_eq!(report.scenarios.len(), 5);
+        assert!(
+            report
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.name == "stable preference recall")
+        );
+        assert!(report.render().contains("## Nodamem Evaluation"));
     }
 
     fn sample_imagined_scenario() -> ImaginedScenario {
