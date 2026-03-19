@@ -17,6 +17,7 @@ moltis-common         = { workspace = true }
 moltis-config         = { workspace = true }
 moltis-memory         = { workspace = true }
 moltis-metrics        = { optional = true, workspace = true }
+moltis-nodamem-adapter = { workspace = true }
 moltis-plugins        = { workspace = true }
 moltis-projects       = { workspace = true }
 moltis-providers      = { workspace = true }
