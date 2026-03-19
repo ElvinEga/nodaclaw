@@ -20,13 +20,15 @@ use {
     tracing::{debug, info, warn},
 };
 
-use moltis_config::{MessageQueueMode, ToolMode};
-use moltis_nodamem_adapter::{
-    MemoryProposalRequest as NodamemMemoryProposalRequest,
-    OutcomeFeedbackRequest as NodamemOutcomeFeedbackRequest, RecallRequest as NodamemRecallRequest,
-    should_propose_memory,
+use {
+    moltis_config::{MessageQueueMode, ToolMode},
+    moltis_nodamem_adapter::{
+        MemoryProposalRequest as NodamemMemoryProposalRequest,
+        OutcomeFeedbackRequest as NodamemOutcomeFeedbackRequest,
+        RecallRequest as NodamemRecallRequest, should_propose_memory,
+    },
+    uuid::Uuid,
 };
-use uuid::Uuid;
 
 use {
     moltis_agents::{
@@ -2810,7 +2812,10 @@ impl LiveChatService {
         text: &str,
         topic: Option<String>,
     ) -> Option<String> {
-        let adapter = self.state.nodamem()?;
+        let Some(adapter) = self.state.nodamem() else {
+            debug!(session = %session_key, "nodamem unavailable; using fallback memory path");
+            return None;
+        };
         match adapter
             .recall_context(&NodamemRecallRequest {
                 text: text.to_owned(),
@@ -2819,10 +2824,28 @@ impl LiveChatService {
             })
             .await
         {
-            Ok(Some(result)) => Some(result.prompt_context),
-            Ok(None) => None,
+            Ok(Some(result)) => {
+                let injected_item_count = result.packet.nodes.len()
+                    + result.packet.lessons.len()
+                    + result.packet.checkpoints.len()
+                    + result.packet.traits.len();
+                debug!(
+                    session = %session_key,
+                    injected_item_count,
+                    node_count = result.packet.nodes.len(),
+                    lesson_count = result.packet.lessons.len(),
+                    checkpoint_count = result.packet.checkpoints.len(),
+                    trait_count = result.packet.traits.len(),
+                    "nodamem context injected into prompt"
+                );
+                Some(result.prompt_context)
+            },
+            Ok(None) => {
+                debug!(session = %session_key, "nodamem returned no context; using fallback memory path");
+                None
+            },
             Err(error) => {
-                warn!(session = %session_key, %error, "nodamem recall_context failed");
+                warn!(session = %session_key, %error, "nodamem recall_context failed; using fallback memory path");
                 None
             },
         }
@@ -2848,13 +2871,16 @@ async fn maybe_propose_exchange_memory(
     assistant_text: &str,
 ) {
     let Some(adapter) = runtime.nodamem() else {
+        debug!(session = %session_key, "nodamem unavailable; skipping propose_memory");
         return;
     };
     if !should_propose_memory(user_text, assistant_text) {
+        debug!(session = %session_key, "nodamem propose_memory skipped by heuristic");
         return;
     }
 
-    if let Err(error) = adapter
+    debug!(session = %session_key, "nodamem propose_memory requested");
+    match adapter
         .propose_memory(&NodamemMemoryProposalRequest {
             session_id: Some(session_key.to_owned()),
             user_text: user_text.to_owned(),
@@ -2863,7 +2889,19 @@ async fn maybe_propose_exchange_memory(
         })
         .await
     {
-        warn!(session = %session_key, %error, "nodamem propose_memory failed");
+        Ok(result) => {
+            debug!(
+                session = %session_key,
+                candidate_node_count = result.candidate_node_count,
+                decision_count = result.decision_count,
+                stored_node_count = result.stored_node_count,
+                stored_edge_count = result.stored_edge_count,
+                "nodamem propose_memory completed"
+            );
+        },
+        Err(error) => {
+            warn!(session = %session_key, %error, "nodamem propose_memory failed");
+        },
     }
 }
 
@@ -2874,22 +2912,43 @@ async fn maybe_record_outcome_feedback(
     user_accepted: bool,
 ) {
     let Some(adapter) = runtime.nodamem() else {
+        debug!(session = %session_key, "nodamem unavailable; skipping record_outcome");
         return;
     };
 
-    if let Err(error) = adapter
+    debug!(
+        session = %session_key,
+        success,
+        user_accepted,
+        "nodamem record_outcome requested"
+    );
+    match adapter
         .record_outcome(&NodamemOutcomeFeedbackRequest {
             outcome_id: format!("{session_key}:{}", Uuid::new_v4()),
             subject_node_id: None,
             success,
-            usefulness: if success { 0.75 } else { 0.1 },
+            usefulness: if success {
+                0.75
+            } else {
+                0.1
+            },
             prediction_correct: success,
             user_accepted,
             validated: true,
         })
         .await
     {
-        warn!(session = %session_key, %error, "nodamem record_outcome failed");
+        Ok(result) => {
+            debug!(
+                session = %session_key,
+                updated_trait_count = result.updated_trait_count,
+                update_count = result.update_count,
+                "nodamem record_outcome completed"
+            );
+        },
+        Err(error) => {
+            warn!(session = %session_key, %error, "nodamem record_outcome failed");
+        },
     }
 }
 
@@ -3418,7 +3477,8 @@ impl ChatService for LiveChatService {
         let project_context = merge_prompt_contexts(
             self.resolve_project_context(&session_key, conn_id.as_deref())
                 .await,
-            self.resolve_nodamem_context(&session_key, &text, None).await,
+            self.resolve_nodamem_context(&session_key, &text, None)
+                .await,
         );
 
         // Dispatch MessageReceived hook (read-only).
@@ -4144,7 +4204,9 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
-        let prompt_context = self.resolve_nodamem_context(&session_key, &text, None).await;
+        let prompt_context = self
+            .resolve_nodamem_context(&session_key, &text, None)
+            .await;
         let active_event_forwarders = Arc::new(RwLock::new(HashMap::new()));
         let terminal_runs = Arc::new(RwLock::new(HashSet::new()));
         let result = if stream_only {
@@ -4234,13 +4296,8 @@ impl ChatService for LiveChatService {
                 self.session_metadata.touch(&session_key, count).await;
             }
 
-            maybe_propose_exchange_memory(
-                &state,
-                &session_key,
-                &text,
-                &assistant_output.text,
-            )
-            .await;
+            maybe_propose_exchange_memory(&state, &session_key, &text, &assistant_output.text)
+                .await;
             maybe_record_outcome_feedback(&state, &session_key, true, true).await;
         } else {
             maybe_record_outcome_feedback(&state, &session_key, false, false).await;
