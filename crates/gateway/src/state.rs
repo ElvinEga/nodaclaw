@@ -368,6 +368,8 @@ pub struct GatewayState {
     /// Memory manager for long-term memory search (None if no embedding provider).
     /// `Arc` because it is cloned into background tokio tasks.
     pub memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
+    /// External Nodamem adapter used for gradual graph-memory integration.
+    pub nodamem: Option<Arc<moltis_nodamem_adapter::NodamemAdapter>>,
     /// Whether the server is bound to a loopback address (localhost/127.0.0.1/::1).
     pub localhost_only: bool,
     /// Whether the server is known to be behind a reverse proxy.
@@ -436,6 +438,7 @@ impl GatewayState {
             false,
             None,
             None,
+            None,
             18789,
             false,
             None,
@@ -461,6 +464,7 @@ impl GatewayState {
         tls_active: bool,
         hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
         memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
+        nodamem: Option<Arc<moltis_nodamem_adapter::NodamemAdapter>>,
         port: u16,
         ws_request_logs: bool,
         deploy_platform: Option<String>,
@@ -483,6 +487,7 @@ impl GatewayState {
             sandbox_router,
             pairing_store,
             memory_manager,
+            nodamem,
             localhost_only,
             behind_proxy,
             tls_active,
