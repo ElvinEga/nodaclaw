@@ -87,6 +87,7 @@ name = "agent-api"
 version = "0.1.0"
 dependencies = [
  "axum 0.6.20",
+ "chrono",
  "libsql",
  "memory-core",
  "memory-imagination",
@@ -98,6 +99,8 @@ dependencies = [
  "memory-store",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6024,8 +6027,11 @@ name = "memory-sleep"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libsql",
  "memory-core",
  "memory-lessons",
+ "memory-store",
+ "tokio",
  "tracing",
  "uuid",
 ]
