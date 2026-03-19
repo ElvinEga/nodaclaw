@@ -41,6 +41,7 @@ moltis-media           = { workspace = true }
 moltis-memory          = { workspace = true }
 moltis-metrics         = { optional = true, workspace = true }
 moltis-msteams         = { workspace = true }
+moltis-nodamem-adapter = { workspace = true }
 moltis-network-filter  = { features = ["proxy", "service"], optional = true, workspace = true }
 moltis-oauth           = { workspace = true }
 moltis-onboarding      = { workspace = true }
