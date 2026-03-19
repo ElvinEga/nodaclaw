@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+name = "moltis-nodamem-adapter"
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-api = { path = "../../../nodamem/agent-api" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+memory-core = { path = "../../../nodamem/memory-core" }
+memory-ingest = { path = "../../../nodamem/memory-ingest" }
+memory-store = { path = "../../../nodamem/memory-store" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
