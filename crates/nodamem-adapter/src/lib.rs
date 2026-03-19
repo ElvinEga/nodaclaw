@@ -96,6 +96,7 @@ struct StoreSnapshot {
     lessons: Vec<memory_core::Lesson>,
     checkpoints: Vec<memory_core::Checkpoint>,
     traits: Vec<memory_core::TraitState>,
+    self_model_snapshot: Option<memory_core::SelfModel>,
 }
 
 impl NodamemAdapter {
@@ -164,6 +165,7 @@ impl NodamemAdapter {
             lessons: snapshot.lessons,
             checkpoints: snapshot.checkpoints,
             traits: snapshot.traits,
+            self_model_snapshot: snapshot.self_model_snapshot,
         })?;
 
         let compact = compact_recall_context(response.clone());
@@ -361,6 +363,7 @@ async fn load_snapshot(runtime: &StoreRuntime) -> anyhow::Result<StoreSnapshot> 
         lessons: runtime.repository().list_lessons().await?,
         checkpoints: runtime.repository().load_recent_checkpoints(3).await?,
         traits: runtime.repository().list_trait_states().await?,
+        self_model_snapshot: runtime.repository().load_latest_self_model().await?,
     })
 }
 
