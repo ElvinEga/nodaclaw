@@ -66,6 +66,29 @@ pub struct OutcomeFeedbackResult {
     pub update_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptMemoryFormatConfig {
+    pub max_chars: usize,
+    pub max_lessons: usize,
+    pub max_preferences_and_goals: usize,
+    pub max_general_memories: usize,
+    pub max_traits: usize,
+    pub include_checkpoint: bool,
+}
+
+impl Default for PromptMemoryFormatConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: 850,
+            max_lessons: 3,
+            max_preferences_and_goals: 3,
+            max_general_memories: 2,
+            max_traits: 3,
+            include_checkpoint: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StoreSnapshot {
     nodes: Vec<Node>,
@@ -140,7 +163,8 @@ impl NodamemAdapter {
         })?;
 
         let compact = compact_recall_context(response.clone());
-        let prompt_context = format_compact_context(&compact);
+        let prompt_context =
+            format_prompt_memory_context(&compact, PromptMemoryFormatConfig::default());
         let source_node_ids = response.packet.nodes.iter().map(|node| node.id).collect();
         debug!(
             session_id = request.session_id.as_deref().unwrap_or(""),
@@ -316,57 +340,243 @@ fn build_exchange_event(request: &MemoryProposalRequest) -> IngestEvent {
     })
 }
 
-fn format_compact_context(
+fn format_prompt_memory_context(
     response: &agent_api::adapters::openclaw_types::OpenClawRecallContextResponse,
+    config: PromptMemoryFormatConfig,
 ) -> String {
-    let mut lines = vec![
-        "## External Memory Context".to_owned(),
-        String::new(),
-        response.summary.clone(),
-    ];
+    let mut seen = HashSet::new();
+    let mut lines = vec!["## Verified Memory Context".to_owned()];
 
-    if !response.nodes.is_empty() {
+    if let Some(summary) = dedupe_text(&mut seen, truncate_line(&response.summary, 180)) {
         lines.push(String::new());
-        lines.push("Relevant memories:".to_owned());
+        lines.push(summary);
+    }
+
+    let lessons = response
+        .lessons
+        .iter()
+        .filter_map(|lesson| {
+            let text = truncate_line(
+                &format!("{}: {}", lesson.title.trim(), lesson.statement.trim()),
+                160,
+            );
+            dedupe_text(&mut seen, text)
+        })
+        .take(config.max_lessons)
+        .collect::<Vec<_>>();
+    if !lessons.is_empty() {
+        lines.push(String::new());
+        lines.push("Validated lessons:".to_owned());
+        lines.extend(lessons.into_iter().map(|line| format!("- {line}")));
+    }
+
+    let preference_or_goal_nodes = response
+        .nodes
+        .iter()
+        .filter(|node| is_preference_or_goal(node))
+        .filter_map(|node| {
+            let text = truncate_line(&format_memory_line(&node.title, &node.summary), 160);
+            dedupe_text(&mut seen, text)
+        })
+        .take(config.max_preferences_and_goals)
+        .collect::<Vec<_>>();
+    if !preference_or_goal_nodes.is_empty() {
+        lines.push(String::new());
+        lines.push("Relevant preferences and goals:".to_owned());
         lines.extend(
-            response
-                .nodes
-                .iter()
-                .take(4)
-                .map(|node| format!("- {}: {}", node.title, node.summary)),
+            preference_or_goal_nodes
+                .into_iter()
+                .map(|line| format!("- {line}")),
         );
     }
 
-    if !response.lessons.is_empty() {
+    let general_memories = response
+        .nodes
+        .iter()
+        .filter(|node| !is_preference_or_goal(node))
+        .filter_map(|node| {
+            let text = truncate_line(&format_memory_line(&node.title, &node.summary), 150);
+            dedupe_text(&mut seen, text)
+        })
+        .take(config.max_general_memories)
+        .collect::<Vec<_>>();
+    if !general_memories.is_empty() {
         lines.push(String::new());
-        lines.push("Lessons:".to_owned());
-        lines.extend(
-            response
-                .lessons
-                .iter()
-                .take(3)
-                .map(|lesson| format!("- {}: {}", lesson.title, lesson.statement)),
-        );
+        lines.push("Other verified context:".to_owned());
+        lines.extend(general_memories.into_iter().map(|line| format!("- {line}")));
     }
 
-    if let Some(checkpoint) = &response.checkpoint_summary {
-        lines.push(String::new());
-        lines.push(format!("Checkpoint: {checkpoint}"));
+    if config.include_checkpoint {
+        if let Some(checkpoint) = response
+            .checkpoint_summary
+            .as_deref()
+            .map(|value| truncate_line(value, 180))
+            .and_then(|value| dedupe_text(&mut seen, value))
+        {
+            lines.push(String::new());
+            lines.push(format!("Checkpoint: {checkpoint}"));
+        }
     }
 
-    if !response.trait_snapshot.is_empty() {
-        let traits = response
-            .trait_snapshot
-            .iter()
-            .take(3)
-            .map(|trait_state| format!("{} ({:.2})", trait_state.label, trait_state.strength))
-            .collect::<Vec<_>>()
-            .join(", ");
+    let traits = response
+        .trait_snapshot
+        .iter()
+        .filter_map(|trait_state| {
+            let text = truncate_line(
+                &format!("{} ({:.2})", trait_state.label.trim(), trait_state.strength),
+                80,
+            );
+            dedupe_text(&mut seen, text)
+        })
+        .take(config.max_traits)
+        .collect::<Vec<_>>();
+    if !traits.is_empty() {
         lines.push(String::new());
-        lines.push(format!("Trait snapshot: {traits}"));
+        lines.push(format!("Trait snapshot: {}", traits.join(", ")));
     }
 
-    lines.join("\n")
+    if lines.len() == 1 {
+        lines.push(String::new());
+        lines.push("No verified memory available.".to_owned());
+    }
+
+    trim_to_configured_length(lines, config.max_chars)
+}
+
+fn trim_to_configured_length(mut lines: Vec<String>, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut output = lines.join("\n");
+    if output.chars().count() <= max_chars {
+        return output;
+    }
+
+    while lines.len() > 3 {
+        lines.pop();
+        output = lines.join("\n");
+        if output.chars().count() <= max_chars {
+            return output;
+        }
+    }
+
+    let mut shortened = output
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    while shortened.ends_with(char::is_whitespace) {
+        shortened.pop();
+    }
+    if shortened.is_empty() {
+        "## Verified Memory Context".to_owned()
+    } else {
+        shortened.push('…');
+        shortened
+    }
+}
+
+fn format_memory_line(title: &str, summary: &str) -> String {
+    let title = title.trim();
+    let summary = summary.trim();
+    if title.is_empty() {
+        summary.to_owned()
+    } else if summary.is_empty() || normalize_for_dedupe(title) == normalize_for_dedupe(summary) {
+        title.to_owned()
+    } else {
+        format!("{title}: {summary}")
+    }
+}
+
+fn dedupe_text(seen: &mut HashSet<String>, text: String) -> Option<String> {
+    let dedupe_keys = dedupe_keys(&text);
+    if dedupe_keys.is_empty()
+        || dedupe_keys.iter().any(|key| is_hypothetical_text(key))
+        || dedupe_keys.iter().any(|key| seen.contains(key))
+    {
+        return None;
+    }
+    seen.extend(dedupe_keys);
+    Some(text)
+}
+
+fn normalize_for_dedupe(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn dedupe_keys(text: &str) -> Vec<String> {
+    let normalized = normalize_for_dedupe(text);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut keys = vec![normalized.clone()];
+    if let Some((_, detail)) = text.split_once(':') {
+        let detail_key = normalize_for_dedupe(detail);
+        if !detail_key.is_empty() && detail_key != normalized {
+            keys.push(detail_key);
+        }
+    }
+    keys
+}
+
+fn truncate_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut shortened = compact
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    while shortened.ends_with(char::is_whitespace) {
+        shortened.pop();
+    }
+    shortened.push('…');
+    shortened
+}
+
+fn is_preference_or_goal(node: &agent_api::adapters::openclaw_types::OpenClawNodeSummary) -> bool {
+    let haystack =
+        format!("{} {} {}", node.title, node.summary, node.tags.join(" ")).to_lowercase();
+    [
+        "preference",
+        "prefers",
+        "likes",
+        "dislikes",
+        "goal",
+        "objective",
+        "plan",
+        "priority",
+    ]
+    .iter()
+    .any(|keyword| haystack.contains(keyword))
+}
+
+fn is_hypothetical_text(normalized_text: &str) -> bool {
+    [
+        "hypothetical",
+        "imagined",
+        "what if",
+        "possible scenario",
+        "potential scenario",
+        "counterfactual",
+        "predicted outcome",
+    ]
+    .iter()
+    .any(|phrase| normalized_text.contains(phrase))
 }
 
 pub fn should_propose_memory(user_text: &str, assistant_text: &str) -> bool {
@@ -395,7 +605,16 @@ pub async fn open_default_adapter(data_dir: PathBuf) -> Option<Arc<NodamemAdapte
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use {super::*, tempfile::TempDir, uuid::Uuid};
+    use {
+        super::*,
+        agent_api::adapters::openclaw_types::{
+            OpenClawLessonSummary, OpenClawNodeSummary, OpenClawRecallContextResponse,
+            OpenClawTraitSummary,
+        },
+        memory_core::{LessonType, TraitType},
+        tempfile::TempDir,
+        uuid::Uuid,
+    };
 
     async fn open_test_adapter() -> (NodamemAdapter, TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -429,7 +648,7 @@ mod tests {
             .expect("recall should succeed")
             .expect("recall should return context");
 
-        assert!(context.prompt_context.contains("External Memory Context"));
+        assert!(context.prompt_context.contains("Verified Memory Context"));
         assert!(!context.source_node_ids.is_empty());
     }
 
@@ -479,5 +698,159 @@ mod tests {
             "please remember this preference",
             "I will remember the user's preference for later turns"
         ));
+    }
+
+    #[test]
+    fn prompt_memory_format_is_compact_and_bounded() {
+        let response = OpenClawRecallContextResponse {
+            summary: "Use verified memory sparingly and only when it helps the current task."
+                .to_owned(),
+            nodes: vec![
+                OpenClawNodeSummary {
+                    node_id: NodeId(Uuid::new_v4()),
+                    title: "User preference".to_owned(),
+                    summary: "Prefers concise release notes with bullet points.".to_owned(),
+                    tags: vec!["preference".to_owned()],
+                    confidence: 0.9,
+                    importance: 0.8,
+                },
+                OpenClawNodeSummary {
+                    node_id: NodeId(Uuid::new_v4()),
+                    title: "Project goal".to_owned(),
+                    summary: "Ship the integration incrementally without a rewrite.".to_owned(),
+                    tags: vec!["goal".to_owned()],
+                    confidence: 0.92,
+                    importance: 0.85,
+                },
+            ],
+            lessons: vec![OpenClawLessonSummary {
+                lesson_id: memory_core::LessonId(Uuid::new_v4()),
+                lesson_type: LessonType::Strategy,
+                title: "Integration approach".to_owned(),
+                statement: "Prefer adapter-backed changes over runtime-wide memory rewrites."
+                    .to_owned(),
+                confidence: 0.95,
+            }],
+            checkpoint_summary: Some(
+                "Current milestone: read path is integrated and under active verification."
+                    .to_owned(),
+            ),
+            trait_snapshot: vec![OpenClawTraitSummary {
+                trait_type: TraitType::Practicality,
+                label: "Practicality".to_owned(),
+                strength: 0.81,
+                confidence: 0.9,
+            }],
+        };
+
+        let formatted = format_prompt_memory_context(&response, PromptMemoryFormatConfig {
+            max_chars: 420,
+            ..PromptMemoryFormatConfig::default()
+        });
+
+        assert!(formatted.contains("## Verified Memory Context"));
+        assert!(formatted.contains("Validated lessons:"));
+        assert!(formatted.contains("Relevant preferences and goals:"));
+        assert!(formatted.chars().count() <= 420);
+    }
+
+    #[test]
+    fn prompt_memory_format_deduplicates_repeated_items() {
+        let response = OpenClawRecallContextResponse {
+            summary: "The user prefers concise release notes.".to_owned(),
+            nodes: vec![
+                OpenClawNodeSummary {
+                    node_id: NodeId(Uuid::new_v4()),
+                    title: "Release notes preference".to_owned(),
+                    summary: "The user prefers concise release notes.".to_owned(),
+                    tags: vec!["preference".to_owned()],
+                    confidence: 0.9,
+                    importance: 0.8,
+                },
+                OpenClawNodeSummary {
+                    node_id: NodeId(Uuid::new_v4()),
+                    title: "Release notes preference".to_owned(),
+                    summary: "The user prefers concise release notes.".to_owned(),
+                    tags: vec!["preference".to_owned()],
+                    confidence: 0.88,
+                    importance: 0.79,
+                },
+            ],
+            lessons: vec![OpenClawLessonSummary {
+                lesson_id: memory_core::LessonId(Uuid::new_v4()),
+                lesson_type: LessonType::User,
+                title: "Release notes preference".to_owned(),
+                statement: "The user prefers concise release notes.".to_owned(),
+                confidence: 0.95,
+            }],
+            checkpoint_summary: None,
+            trait_snapshot: vec![],
+        };
+
+        let formatted =
+            format_prompt_memory_context(&response, PromptMemoryFormatConfig::default());
+
+        assert_eq!(
+            formatted
+                .matches("The user prefers concise release notes.")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn prompt_memory_format_excludes_hypothetical_content() {
+        let response = OpenClawRecallContextResponse {
+            summary: "Verified memory available for the current task.".to_owned(),
+            nodes: vec![
+                OpenClawNodeSummary {
+                    node_id: NodeId(Uuid::new_v4()),
+                    title: "Possible scenario".to_owned(),
+                    summary: "Hypothetical launch plan if the user changes priorities.".to_owned(),
+                    tags: vec!["scenario".to_owned()],
+                    confidence: 0.5,
+                    importance: 0.4,
+                },
+                OpenClawNodeSummary {
+                    node_id: NodeId(Uuid::new_v4()),
+                    title: "User goal".to_owned(),
+                    summary: "Finish the rollout with minimal disruption.".to_owned(),
+                    tags: vec!["goal".to_owned()],
+                    confidence: 0.91,
+                    importance: 0.84,
+                },
+            ],
+            lessons: vec![],
+            checkpoint_summary: Some(
+                "Imagined paths are not injected as verified memory.".to_owned(),
+            ),
+            trait_snapshot: vec![],
+        };
+
+        let formatted =
+            format_prompt_memory_context(&response, PromptMemoryFormatConfig::default());
+
+        assert!(!formatted.to_lowercase().contains("hypothetical"));
+        assert!(!formatted.to_lowercase().contains("possible scenario"));
+        assert!(formatted.contains("Finish the rollout with minimal disruption."));
+    }
+
+    #[test]
+    fn prompt_memory_format_has_stable_empty_state() {
+        let response = OpenClawRecallContextResponse {
+            summary: String::new(),
+            nodes: vec![],
+            lessons: vec![],
+            checkpoint_summary: None,
+            trait_snapshot: vec![],
+        };
+
+        let formatted =
+            format_prompt_memory_context(&response, PromptMemoryFormatConfig::default());
+
+        assert_eq!(
+            formatted,
+            "## Verified Memory Context\n\nNo verified memory available."
+        );
     }
 }
