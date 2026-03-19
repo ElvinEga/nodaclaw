@@ -101,9 +101,10 @@ struct StoreSnapshot {
 impl NodamemAdapter {
     pub async fn open(config: StoreConfig) -> anyhow::Result<Self> {
         let runtime = StoreRuntime::open(config).await?;
+        let service = AgentApiService::new_with_connection(runtime.database.connect()?);
         Ok(Self {
             runtime: Mutex::new(runtime),
-            service: AgentApiService::new(),
+            service,
         })
     }
 
