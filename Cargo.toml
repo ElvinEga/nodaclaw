@@ -117,7 +117,7 @@ unwrap_used = "deny"
 [workspace.package]
 edition      = "2024"
 license      = "MIT"
-repository   = "https://github.com/moltis-org/moltis"
+repository   = "https://github.com/ElvinEga/nodaclaw"
 rust-version = "1.91"
 version      = "0.1.0"
 
