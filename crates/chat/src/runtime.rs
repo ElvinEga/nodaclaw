@@ -92,6 +92,11 @@ pub trait ChatRuntime: Send + Sync {
     /// Memory manager for long-term memory search.
     fn memory_manager(&self) -> Option<&Arc<moltis_memory::manager::MemoryManager>>;
 
+    /// External Nodamem adapter for gradual memory integration.
+    fn nodamem(&self) -> Option<&Arc<moltis_nodamem_adapter::NodamemAdapter>> {
+        None
+    }
+
     // ── Cached location ──────────────────────────────────────────────────
 
     /// Cached user geolocation from browser.
