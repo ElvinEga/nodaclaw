@@ -3317,6 +3317,8 @@ pub async fn prepare_gateway(
             },
         }
     };
+
+    let nodamem = moltis_nodamem_adapter::open_default_adapter(data_dir.clone()).await;
     startup_mem_probe.checkpoint("memory_manager.initialized");
 
     let is_localhost =
@@ -3381,6 +3383,7 @@ pub async fn prepare_gateway(
         tls_enabled_for_gateway,
         hook_registry.clone(),
         memory_manager.clone(),
+        nodamem.clone(),
         port,
         config.server.ws_request_logs,
         deploy_platform.clone(),
