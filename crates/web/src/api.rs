@@ -37,6 +37,9 @@ const SANDBOX_DAEMON_RESTART_FAILED: &str = "SANDBOX_DAEMON_RESTART_FAILED";
 const SANDBOX_SHARED_HOME_SAVE_FAILED: &str = "SANDBOX_SHARED_HOME_SAVE_FAILED";
 const SESSION_HISTORY_FAILED: &str = "SESSION_HISTORY_FAILED";
 const SESSION_LIST_FAILED: &str = "SESSION_LIST_FAILED";
+const NODAMEM_GRAPH_UNAVAILABLE: &str = "NODAMEM_GRAPH_UNAVAILABLE";
+const NODAMEM_GRAPH_FAILED: &str = "NODAMEM_GRAPH_FAILED";
+const NODAMEM_GRAPH_NODE_NOT_FOUND: &str = "NODAMEM_GRAPH_NODE_NOT_FOUND";
 const SESSION_LIST_DEFAULT_LIMIT: usize = 40;
 const SESSION_LIST_MAX_LIMIT: usize = 200;
 const SESSION_HISTORY_DEFAULT_LIMIT: usize = 120;
@@ -51,6 +54,52 @@ fn api_error(code: &str, error: impl Into<String>) -> serde_json::Value {
 
 fn api_error_response(status: StatusCode, code: &str, error: impl Into<String>) -> Response {
     (status, Json(api_error(code, error))).into_response()
+}
+
+pub async fn api_nodamem_graph_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(adapter) = state.gateway.nodamem.as_ref() else {
+        return api_error_response(
+            StatusCode::NOT_FOUND,
+            NODAMEM_GRAPH_UNAVAILABLE,
+            "Nodamem adapter is not enabled",
+        );
+    };
+
+    match adapter.inspect_graph_snapshot().await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            NODAMEM_GRAPH_FAILED,
+            error.to_string(),
+        ),
+    }
+}
+
+pub async fn api_nodamem_graph_node_handler(
+    Path(node_id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(adapter) = state.gateway.nodamem.as_ref() else {
+        return api_error_response(
+            StatusCode::NOT_FOUND,
+            NODAMEM_GRAPH_UNAVAILABLE,
+            "Nodamem adapter is not enabled",
+        );
+    };
+
+    match adapter.inspect_graph_node_by_id(&node_id).await {
+        Ok(Some(detail)) => Json(detail).into_response(),
+        Ok(None) => api_error_response(
+            StatusCode::NOT_FOUND,
+            NODAMEM_GRAPH_NODE_NOT_FOUND,
+            "Node not found",
+        ),
+        Err(error) => api_error_response(
+            StatusCode::BAD_REQUEST,
+            NODAMEM_GRAPH_FAILED,
+            error.to_string(),
+        ),
+    }
 }
 
 #[derive(serde::Deserialize)]
