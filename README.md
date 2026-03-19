@@ -1,14 +1,14 @@
 <div align="center">
 
-<a href="https://moltis.org"><img src="https://raw.githubusercontent.com/moltis-org/moltis/main/website/favicon.svg" alt="Moltis" width="64"></a>
+<a href="https://github.com/ElvinEga/nodaclaw"><img src="https://raw.githubusercontent.com/moltis-org/moltis/main/website/favicon.svg" alt="Nodaclaw" width="64"></a>
 
-# Moltis — A Rust-native claw you can trust
+# Nodaclaw — A Rust-native claw you can trust
 
 One binary — sandboxed, secure, yours.
 
-[![CI](https://github.com/moltis-org/moltis/actions/workflows/ci.yml/badge.svg)](https://github.com/moltis-org/moltis/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/moltis-org/moltis/graph/badge.svg)](https://codecov.io/gh/moltis-org/moltis)
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json&style=flat&label=CodSpeed)](https://codspeed.io/moltis-org/moltis)
+[![CI](https://github.com/ElvinEga/nodaclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/ElvinEga/nodaclaw/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/ElvinEga/nodaclaw/graph/badge.svg)](https://codecov.io/gh/ElvinEga/nodaclaw)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json&style=flat&label=CodSpeed)](https://codspeed.io/ElvinEga/nodaclaw)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
 [![Discord](https://img.shields.io/discord/1469505370169933837?color=5865F2&label=Discord&logo=discord&logoColor=white)](https://discord.gg/XnmrepsXp5)
@@ -19,7 +19,14 @@ One binary — sandboxed, secure, yours.
 
 ---
 
-Moltis recently hit [the front page of Hacker News](https://news.ycombinator.com/item?id=46993587). Please [open an issue](https://github.com/moltis-org/moltis/issues) for any friction at all. I'm focused on making Moltis excellent.
+Nodaclaw is a minimal rebrand of the Moltis codebase, forked from [moltis-org/moltis](https://github.com/moltis-org/moltis).
+
+This fork keeps core functionality intact while the product identity shifts:
+
+- `Nodaclaw` is the runtime and assistant shell.
+- `Nodamem` will be the local-first memory engine.
+
+The CLI, crate names, config paths, and environment variables still use `moltis` where that is currently part of the implementation.
 
 **Secure by design** — Your keys never leave your machine. Every command runs in a sandboxed container, never on your host.
 
@@ -47,7 +54,7 @@ cargo install moltis --git https://github.com/moltis-org/moltis
 
 ## Comparison
 
-| | OpenClaw | PicoClaw | NanoClaw | ZeroClaw | **Moltis** |
+| | OpenClaw | PicoClaw | NanoClaw | ZeroClaw | **Nodaclaw** |
 |---|---|---|---|---|---|
 | Language | TypeScript | Go | TypeScript | Rust | **Rust** |
 | Agent loop | ~430K LoC | Small | ~500 LoC | ~3.4K LoC | **~5K LoC** (`runner.rs` + `model.rs`) |
@@ -130,7 +137,7 @@ See [Security Architecture](https://docs.moltis.org/security.html) for details.
 
 ## How It Works
 
-Moltis is a **local-first AI gateway** — a single Rust binary that sits
+Nodaclaw is a **local-first AI gateway** — a single Rust binary that sits
 between you and multiple LLM providers. Everything runs on your machine; no
 cloud relay required.
 
@@ -178,8 +185,8 @@ See [Quickstart](https://docs.moltis.org/quickstart.html) for gateway startup, m
 Requires [just](https://github.com/casey/just) (command runner) and Node.js (for Tailwind CSS).
 
 ```bash
-git clone https://github.com/moltis-org/moltis.git
-cd moltis
+git clone https://github.com/ElvinEga/nodaclaw.git
+cd nodaclaw
 just build-css                  # Build Tailwind CSS for the web UI
 just build-release              # Build in release mode
 cargo run --release --bin moltis
@@ -194,6 +201,8 @@ cargo run --release --bin moltis
 
 Open `https://moltis.localhost:3000`. On first run, a setup code is printed to
 the terminal — enter it in the web UI to set your password or register a passkey.
+
+The runtime branding is `Nodaclaw`, but the binary name remains `moltis` in this minimal pass.
 
 Optional flags: `--config-dir /path/to/config --data-dir /path/to/data`
 
@@ -235,7 +244,7 @@ See [Cloud Deploy docs](https://docs.moltis.org/cloud-deploy.html) for details.
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=moltis-org/moltis&type=date&legend=top-left)](https://www.star-history.com/#moltis-org/moltis&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=ElvinEga/nodaclaw&type=date&legend=top-left)](https://www.star-history.com/#ElvinEga/nodaclaw&type=date&legend=top-left)
 
 ## License
 
