@@ -34,3 +34,10 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - Start the app with `RUST_LOG=moltis_chat=debug,moltis_nodamem_adapter=debug cargo run -p moltis-gateway`.
 - Send a message with durable content such as a preference or project fact, then confirm logs show `recall_context`, `propose_memory`, and `record_outcome`.
 - Send a follow-up question that should reuse that fact and confirm logs show either `nodamem context injected into prompt` or an explicit fallback message if Nodamem had no usable context.
+
+## Prompt Formatting Rules
+
+- Prompt injection is formatted in `crates/nodamem-adapter/src/lib.rs` as a bounded `Verified Memory Context` section.
+- The formatter prefers concise summary text, validated lessons, and preference or goal memories before any general context.
+- Duplicate lines are removed before prompt injection, and hypothetical or imagined wording is filtered so it is not presented as verified memory.
+- The checkpoint summary is optional, and total prompt memory length is capped through `PromptMemoryFormatConfig` to keep the injected section compact.
