@@ -212,7 +212,10 @@ impl NodamemAdapter {
             .admission_decisions
             .iter()
             .filter_map(|decision| match decision.action {
-                memory_core::AdmissionAction::CreateNewNode => Some(decision.candidate_node_id),
+                memory_core::AdmissionAction::CreateNewNode
+                | memory_core::AdmissionAction::SupersedeExistingNode { .. } => {
+                    Some(decision.candidate_node_id)
+                },
                 _ => None,
             })
             .collect();
@@ -220,6 +223,25 @@ impl NodamemAdapter {
         let now = Utc::now();
         let mut stored_node_count = 0;
         let mut stored_edge_count = 0;
+
+        for decision in &response.admission_decisions {
+            if let memory_core::AdmissionAction::SupersedeExistingNode { target_node_id } =
+                decision.action
+            {
+                if let Some(mut existing) =
+                    runtime.repository().get_node_by_id(target_node_id).await?
+                {
+                    existing.status = MemoryStatus::Archived;
+                    existing.updated_at = now;
+                    runtime.repository().update_node(&existing).await?;
+                    info!(
+                        superseded_node_id = %target_node_id.0,
+                        replacement_node_id = %decision.candidate_node_id.0,
+                        "nodamem archived superseded preference or goal before durable write"
+                    );
+                }
+            }
+        }
 
         for node in response
             .ingest_output
@@ -287,8 +309,12 @@ impl NodamemAdapter {
         );
         let runtime = self.runtime.lock().await;
         let existing_traits = runtime.repository().list_trait_states().await?;
+        let existing_lessons = runtime.repository().list_lessons().await?;
+        let existing_self_model = runtime.repository().load_latest_self_model().await?;
         let response = self.service.record_outcome(&RecordOutcomeRequest {
             existing_traits,
+            existing_lessons,
+            existing_self_model,
             outcome: OutcomeRecordDto {
                 outcome_id: request.outcome_id.clone(),
                 subject_node_id: request.subject_node_id,
@@ -303,6 +329,12 @@ impl NodamemAdapter {
         for trait_state in &response.updated_traits {
             runtime.repository().save_trait_state(trait_state).await?;
         }
+        for trait_event in &response.trait_events {
+            runtime.repository().append_trait_event(trait_event).await?;
+        }
+        if let Some(self_model) = &response.refreshed_self_model {
+            runtime.repository().save_self_model(self_model).await?;
+        }
 
         let result = OutcomeFeedbackResult {
             updated_trait_count: response.updated_traits.len(),
@@ -313,6 +345,8 @@ impl NodamemAdapter {
             success = request.success,
             updated_trait_count = result.updated_trait_count,
             update_count = result.update_count,
+            trait_event_count = response.trait_events.len(),
+            self_model_refreshed = response.refreshed_self_model.is_some(),
             "nodamem record_outcome applied updates"
         );
 
@@ -628,7 +662,7 @@ mod tests {
         (adapter, dir)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn read_path_returns_compact_context() {
         let (adapter, _dir) = open_test_adapter().await;
         let proposal = adapter
@@ -675,6 +709,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_preference_is_archived_and_replaced() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("session-3".to_owned()),
+                user_text: "Remember that the user prefers verbose release notes.".to_owned(),
+                assistant_text: "Noted. I will keep release notes verbose.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("initial proposal should succeed");
+
+        let result = adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("session-3".to_owned()),
+                user_text: "The user no longer prefers verbose release notes; keep them concise."
+                    .to_owned(),
+                assistant_text: "Understood. I will keep release notes concise.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("replacement proposal should succeed");
+
+        assert!(result.stored_node_count > 0);
+
+        let runtime = adapter.runtime.lock().await;
+        let nodes = runtime
+            .repository()
+            .list_nodes()
+            .await
+            .expect("nodes should load");
+        let preference_nodes = nodes
+            .into_iter()
+            .filter(|node| node.node_type == memory_core::NodeType::Preference)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            preference_nodes
+                .iter()
+                .filter(|node| node.status == MemoryStatus::Archived)
+                .count(),
+            1
+        );
+        assert_eq!(
+            preference_nodes
+                .iter()
+                .filter(|node| matches!(
+                    node.status,
+                    MemoryStatus::Active | MemoryStatus::Reinforced
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn outcome_feedback_persists_trait_updates() {
         let (adapter, _dir) = open_test_adapter().await;
         let outcome = adapter
@@ -692,6 +782,22 @@ mod tests {
 
         assert!(outcome.updated_trait_count > 0);
         assert!(outcome.update_count > 0);
+
+        let runtime = adapter.runtime.lock().await;
+        let traits = runtime
+            .repository()
+            .list_trait_states()
+            .await
+            .expect("traits should load");
+        let events = runtime
+            .repository()
+            .load_trait_events(None, Some(50))
+            .await
+            .expect("trait events should load");
+
+        assert!(!traits.is_empty());
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| event.outcome_id.is_some()));
     }
 
     #[test]
