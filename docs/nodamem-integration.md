@@ -63,3 +63,11 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - `crates/nodamem-adapter/src/lib.rs` now exposes compact developer-facing inspection views through `inspect_memory_flow(...)` for verified packet contents, hypothetical scenarios, self-model continuity sources, recent trait-update reasons, lesson audit reasons, and superseded preference or goal history.
 - The same adapter crate also provides `run_evaluation_harness_at(...)`, which runs a disposable repeatable evaluation over stable preference recall, contradiction handling, duplicate suppression, grounded imagination, and scenario review feedback.
 - Both outputs are intended for debugging and regression checks only; they do not change prompt assembly or verified-memory formatting.
+
+## Graph UI Usage
+
+- Open `Settings -> Nodamem Graph` to inspect the live graph snapshot exposed by the adapter-backed debug endpoints.
+- Use search first when the graph is crowded; it matches node title, type, summary text, and raw ids.
+- After selecting a node, enable `Neighborhood of selected node` and use `Focus selected` to reduce visual noise around the local cluster.
+- Enable `Hide weak low-confidence nodes` when you want to inspect durable graph state instead of low-value candidates.
+- Verified memory stays green or blue, imagined scenarios stay amber, and archived or superseded records remain muted with dashed outlines.
