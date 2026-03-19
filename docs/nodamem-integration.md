@@ -26,3 +26,11 @@ Nodaclaw does not write directly into Nodamem tables from chat/gateway modules. 
 - Explicit user acceptance/rejection UI feedback is not yet wired; current outcome recording covers turn success/failure.
 - Legacy file memory and Nodamem graph memory currently coexist. Tool-based memory retrieval still uses the old file-backed search path.
 - Lesson persistence remains conservative; the first pass focuses on read recall, validated memory proposals, and outcome-driven trait updates.
+
+## Manual Verification
+
+Run the gateway with debug logging enabled and watch for the compact Nodamem trace events:
+
+- Start the app with `RUST_LOG=moltis_chat=debug,moltis_nodamem_adapter=debug cargo run -p moltis-gateway`.
+- Send a message with durable content such as a preference or project fact, then confirm logs show `recall_context`, `propose_memory`, and `record_outcome`.
+- Send a follow-up question that should reuse that fact and confirm logs show either `nodamem context injected into prompt` or an explicit fallback message if Nodamem had no usable context.
