@@ -87,6 +87,7 @@ name = "agent-api"
 version = "0.1.0"
 dependencies = [
  "axum 0.6.20",
+ "libsql",
  "memory-core",
  "memory-imagination",
  "memory-ingest",
