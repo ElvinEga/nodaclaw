@@ -57,3 +57,9 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - Imagined scenarios are stored only in `imagined_nodes` and carried through `MemoryPacket.imagined_scenarios`; they are not promoted into verified `nodes` without a separate validation flow.
 - Manual verification: ask a planning-oriented question such as "brainstorm rollout options for next week" and confirm the system prompt contains both `## Verified Memory Context` and `## Hypothetical Planning Scenarios`, while a factual recall question should only include the verified block.
 - After a planning turn succeeds or fails, confirm logs show `nodamem imagined scenario review requested` followed by `nodamem imagined scenario review completed`, and inspect `imagined_nodes.status` to verify scenarios were marked `accepted_as_hypothesis` or `rejected`.
+
+## Inspection And Evaluation
+
+- `crates/nodamem-adapter/src/lib.rs` now exposes compact developer-facing inspection views through `inspect_memory_flow(...)` for verified packet contents, hypothetical scenarios, self-model continuity sources, recent trait-update reasons, lesson audit reasons, and superseded preference or goal history.
+- The same adapter crate also provides `run_evaluation_harness_at(...)`, which runs a disposable repeatable evaluation over stable preference recall, contradiction handling, duplicate suppression, grounded imagination, and scenario review feedback.
+- Both outputs are intended for debugging and regression checks only; they do not change prompt assembly or verified-memory formatting.
