@@ -14,6 +14,7 @@ use {
     memory_imagination::{ImaginationService, ScenarioReviewDecision},
     memory_ingest::{AdmissionContext, IngestEvent, MessageEvent},
     memory_store::{StoreConfig, StoreRuntime},
+    serde::Serialize,
     tokio::sync::Mutex,
     tracing::{debug, info, warn},
     uuid::Uuid,
@@ -206,6 +207,44 @@ impl EvaluationHarnessReport {
         }
         lines.join("\n")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphInspectionSnapshot {
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    pub lessons: Vec<memory_core::Lesson>,
+    pub checkpoints: Vec<memory_core::Checkpoint>,
+    pub traits: Vec<memory_core::TraitState>,
+    pub imagined_scenarios: Vec<memory_core::ImaginedScenario>,
+    pub superseded_history: Vec<Node>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphInspectionNodeDetail {
+    pub node: Node,
+    pub summary: String,
+    pub content: Option<String>,
+    pub source_event_id: Option<String>,
+    pub reasons: Vec<String>,
+    pub lesson_links: Vec<GraphInspectionLessonLink>,
+    pub related_nodes: Vec<GraphInspectionRelatedNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphInspectionLessonLink {
+    pub lesson_id: String,
+    pub title: String,
+    pub relation: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphInspectionRelatedNode {
+    pub node_id: String,
+    pub title: String,
+    pub relation: &'static str,
+    pub node_type: NodeType,
+    pub status: MemoryStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +669,97 @@ impl NodamemAdapter {
         );
 
         Ok(report)
+    }
+
+    pub async fn inspect_graph_snapshot(&self) -> anyhow::Result<GraphInspectionSnapshot> {
+        let runtime = self.runtime.lock().await;
+        let repository = runtime.repository();
+        let nodes = repository.list_nodes().await?;
+        let imagined_scenarios = repository.list_imagined_scenarios(200).await?;
+        let superseded_history = nodes
+            .iter()
+            .filter(|node| {
+                matches!(node.node_type, NodeType::Preference | NodeType::Goal)
+                    && node.status == MemoryStatus::Archived
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let snapshot = GraphInspectionSnapshot {
+            nodes,
+            edges: repository.list_edges().await?,
+            lessons: repository.list_lessons().await?,
+            checkpoints: repository.load_recent_checkpoints(20).await?,
+            traits: repository.list_trait_states().await?,
+            imagined_scenarios,
+            superseded_history,
+        };
+
+        debug!(
+            node_count = snapshot.nodes.len(),
+            edge_count = snapshot.edges.len(),
+            imagined_count = snapshot.imagined_scenarios.len(),
+            "nodamem graph snapshot generated"
+        );
+
+        Ok(snapshot)
+    }
+
+    pub async fn inspect_graph_node(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<GraphInspectionNodeDetail>> {
+        let runtime = self.runtime.lock().await;
+        let repository = runtime.repository();
+        let Some(audit) = repository.inspect_node_audit(node_id).await? else {
+            return Ok(None);
+        };
+        let related_nodes = repository.get_neighbors(node_id).await?;
+
+        let detail =
+            GraphInspectionNodeDetail {
+                summary: audit.node.summary.clone(),
+                content: audit.node.content.clone(),
+                source_event_id: audit.node.source_event_id.clone(),
+                reasons: audit.reasons.clone(),
+                lesson_links: audit
+                    .supporting_lessons
+                    .iter()
+                    .map(|lesson| GraphInspectionLessonLink {
+                        lesson_id: lesson.id.0.to_string(),
+                        title: lesson.title.clone(),
+                        relation: "supports",
+                    })
+                    .chain(audit.contradicting_lessons.iter().map(|lesson| {
+                        GraphInspectionLessonLink {
+                            lesson_id: lesson.id.0.to_string(),
+                            title: lesson.title.clone(),
+                            relation: "contradicts",
+                        }
+                    }))
+                    .collect(),
+                related_nodes: related_nodes
+                    .into_iter()
+                    .map(|node| GraphInspectionRelatedNode {
+                        node_id: node.id.0.to_string(),
+                        title: node.title,
+                        relation: "related",
+                        node_type: node.node_type,
+                        status: node.status,
+                    })
+                    .collect(),
+                node: audit.node,
+            };
+
+        Ok(Some(detail))
+    }
+
+    pub async fn inspect_graph_node_by_id(
+        &self,
+        node_id: &str,
+    ) -> anyhow::Result<Option<GraphInspectionNodeDetail>> {
+        let parsed = NodeId(Uuid::parse_str(node_id.trim())?);
+        self.inspect_graph_node(parsed).await
     }
 
     pub async fn run_evaluation_harness_at(
@@ -2023,6 +2153,69 @@ mod tests {
                 .any(|scenario| scenario.name == "stable preference recall")
         );
         assert!(report.render().contains("## Nodamem Evaluation"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_snapshot_exposes_verified_and_imagined_records() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("graph-session".to_owned()),
+                user_text: "Remember the rollout goal is to stage by tenant size.".to_owned(),
+                assistant_text: "I will plan a staged rollout by tenant size.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+        let _ = adapter
+            .recall_context(&RecallRequest {
+                text: "Brainstorm staged rollout options.".to_owned(),
+                session_id: Some("graph-session".to_owned()),
+                topic: Some("planning".to_owned()),
+                include_hypothetical: true,
+            })
+            .await
+            .expect("recall should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+
+        assert!(!snapshot.nodes.is_empty());
+        assert!(!snapshot.imagined_scenarios.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_node_detail_returns_related_debug_information() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("detail-session".to_owned()),
+                user_text: "Remember the user prefers short deployment updates.".to_owned(),
+                assistant_text: "I will keep deployment updates short.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .first()
+            .expect("snapshot should contain node")
+            .id;
+        let detail = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        assert!(!detail.summary.is_empty());
+        assert_eq!(detail.node.id, node_id);
     }
 
     fn sample_imagined_scenario() -> ImaginedScenario {
