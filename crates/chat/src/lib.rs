@@ -21,6 +21,12 @@ use {
 };
 
 use moltis_config::{MessageQueueMode, ToolMode};
+use moltis_nodamem_adapter::{
+    MemoryProposalRequest as NodamemMemoryProposalRequest,
+    OutcomeFeedbackRequest as NodamemOutcomeFeedbackRequest, RecallRequest as NodamemRecallRequest,
+    should_propose_memory,
+};
+use uuid::Uuid;
 
 use {
     moltis_agents::{
@@ -2797,6 +2803,94 @@ impl LiveChatService {
         };
         Some(ctx.to_prompt_section())
     }
+
+    async fn resolve_nodamem_context(
+        &self,
+        session_key: &str,
+        text: &str,
+        topic: Option<String>,
+    ) -> Option<String> {
+        let adapter = self.state.nodamem()?;
+        match adapter
+            .recall_context(&NodamemRecallRequest {
+                text: text.to_owned(),
+                session_id: Some(session_key.to_owned()),
+                topic,
+            })
+            .await
+        {
+            Ok(Some(result)) => Some(result.prompt_context),
+            Ok(None) => None,
+            Err(error) => {
+                warn!(session = %session_key, %error, "nodamem recall_context failed");
+                None
+            },
+        }
+    }
+}
+
+fn merge_prompt_contexts(
+    project_context: Option<String>,
+    nodamem_context: Option<String>,
+) -> Option<String> {
+    match (project_context, nodamem_context) {
+        (Some(project), Some(memory)) => Some(format!("{project}\n\n{memory}")),
+        (Some(project), None) => Some(project),
+        (None, Some(memory)) => Some(memory),
+        (None, None) => None,
+    }
+}
+
+async fn maybe_propose_exchange_memory(
+    runtime: &Arc<dyn ChatRuntime>,
+    session_key: &str,
+    user_text: &str,
+    assistant_text: &str,
+) {
+    let Some(adapter) = runtime.nodamem() else {
+        return;
+    };
+    if !should_propose_memory(user_text, assistant_text) {
+        return;
+    }
+
+    if let Err(error) = adapter
+        .propose_memory(&NodamemMemoryProposalRequest {
+            session_id: Some(session_key.to_owned()),
+            user_text: user_text.to_owned(),
+            assistant_text: assistant_text.to_owned(),
+            event_id: Uuid::new_v4().to_string(),
+        })
+        .await
+    {
+        warn!(session = %session_key, %error, "nodamem propose_memory failed");
+    }
+}
+
+async fn maybe_record_outcome_feedback(
+    runtime: &Arc<dyn ChatRuntime>,
+    session_key: &str,
+    success: bool,
+    user_accepted: bool,
+) {
+    let Some(adapter) = runtime.nodamem() else {
+        return;
+    };
+
+    if let Err(error) = adapter
+        .record_outcome(&NodamemOutcomeFeedbackRequest {
+            outcome_id: format!("{session_key}:{}", Uuid::new_v4()),
+            subject_node_id: None,
+            success,
+            usefulness: if success { 0.75 } else { 0.1 },
+            prediction_correct: success,
+            user_accepted,
+            validated: true,
+        })
+        .await
+    {
+        warn!(session = %session_key, %error, "nodamem record_outcome failed");
+    }
 }
 
 #[async_trait]
@@ -2939,7 +3033,7 @@ impl ChatService for LiveChatService {
 
         if let Some(shell_command) = explicit_shell_command {
             // Generate run_id early so we can link the user message to this run.
-            let run_id = uuid::Uuid::new_v4().to_string();
+            let run_id = Uuid::new_v4().to_string();
             let run_id_clone = run_id.clone();
             let channel_meta = params.get("channel").cloned();
             let user_audio = user_audio_path_from_params(&params, &session_key);
@@ -3321,9 +3415,11 @@ impl ChatService for LiveChatService {
         }
 
         // Resolve project context for this connection's active project.
-        let project_context = self
-            .resolve_project_context(&session_key, conn_id.as_deref())
-            .await;
+        let project_context = merge_prompt_contexts(
+            self.resolve_project_context(&session_key, conn_id.as_deref())
+                .await,
+            self.resolve_nodamem_context(&session_key, &text, None).await,
+        );
 
         // Dispatch MessageReceived hook (read-only).
         if let Some(ref hooks) = self.hook_registry {
@@ -3342,7 +3438,7 @@ impl ChatService for LiveChatService {
         }
 
         // Generate run_id early so we can link the user message to its agent run.
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
 
         // Convert session-crate content to agents-crate content for the LLM.
         // Must happen before `message_content` is moved into `user_msg`.
@@ -3666,6 +3762,7 @@ impl ChatService for LiveChatService {
         let active_event_forwarders = Arc::clone(&self.active_event_forwarders);
         let terminal_runs = Arc::clone(&self.terminal_runs);
         let deferred_channel_target = deferred_channel_target.clone();
+        let user_text_for_nodamem = text.clone();
 
         let handle = tokio::spawn(async move {
             let permit = permit; // hold permit until agent run completes
@@ -3795,6 +3892,7 @@ impl ChatService for LiveChatService {
 
             // Persist assistant response (even empty ones — needed for LLM history coherence).
             if let Some(assistant_output) = assistant_text {
+                let assistant_text_for_nodamem = assistant_output.text.clone();
                 let assistant_msg = PersistedMessage::Assistant {
                     content: assistant_output.text,
                     created_at: Some(now_ms()),
@@ -3822,6 +3920,17 @@ impl ChatService for LiveChatService {
                 if let Ok(count) = session_store.count(&session_key_clone).await {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
+
+                maybe_propose_exchange_memory(
+                    &state,
+                    &session_key_clone,
+                    &user_text_for_nodamem,
+                    &assistant_text_for_nodamem,
+                )
+                .await;
+                maybe_record_outcome_feedback(&state, &session_key_clone, true, true).await;
+            } else {
+                maybe_record_outcome_feedback(&state, &session_key_clone, false, false).await;
             }
 
             let _ = LiveChatService::wait_for_event_forwarder(
@@ -4000,7 +4109,7 @@ impl ChatService for LiveChatService {
             history.pop();
         }
 
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
         let state = Arc::clone(&self.state);
         let tool_registry = Arc::clone(&self.tool_registry);
         let hook_registry = self.hook_registry.clone();
@@ -4035,6 +4144,7 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
+        let prompt_context = self.resolve_nodamem_context(&session_key, &text, None).await;
         let active_event_forwarders = Arc::new(RwLock::new(HashMap::new()));
         let terminal_runs = Arc::new(RwLock::new(HashSet::new()));
         let result = if stream_only {
@@ -4050,7 +4160,7 @@ impl ChatService for LiveChatService {
                 &session_key,
                 &session_agent_id,
                 desired_reply_medium,
-                None,
+                prompt_context.as_deref(),
                 user_message_index,
                 &[],
                 Some(&runtime_context),
@@ -4074,7 +4184,7 @@ impl ChatService for LiveChatService {
                 &session_key,
                 &session_agent_id,
                 desired_reply_medium,
-                None,
+                prompt_context.as_deref(),
                 Some(&runtime_context),
                 user_message_index,
                 &[],
@@ -4123,6 +4233,17 @@ impl ChatService for LiveChatService {
             if let Ok(count) = self.session_store.count(&session_key).await {
                 self.session_metadata.touch(&session_key, count).await;
             }
+
+            maybe_propose_exchange_memory(
+                &state,
+                &session_key,
+                &text,
+                &assistant_output.text,
+            )
+            .await;
+            maybe_record_outcome_feedback(&state, &session_key, true, true).await;
+        } else {
+            maybe_record_outcome_feedback(&state, &session_key, false, false).await;
         }
 
         match result {
@@ -4784,9 +4905,19 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = self
-            .resolve_project_context(&session_key, conn_id.as_deref())
-            .await;
+        let project_context = merge_prompt_contexts(
+            self.resolve_project_context(&session_key, conn_id.as_deref())
+                .await,
+            self.resolve_nodamem_context(
+                &session_key,
+                history
+                    .last()
+                    .and_then(|entry| entry.get("content").and_then(Value::as_str))
+                    .unwrap_or(""),
+                None,
+            )
+            .await,
+        );
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -4907,9 +5038,19 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = self
-            .resolve_project_context(&session_key, conn_id.as_deref())
-            .await;
+        let project_context = merge_prompt_contexts(
+            self.resolve_project_context(&session_key, conn_id.as_deref())
+                .await,
+            self.resolve_nodamem_context(
+                &session_key,
+                history
+                    .last()
+                    .and_then(|entry| entry.get("content").and_then(Value::as_str))
+                    .unwrap_or(""),
+                None,
+            )
+            .await,
+        );
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5358,7 +5499,7 @@ async fn run_explicit_shell_command(
     client_seq: Option<u64>,
 ) -> AssistantTurnOutput {
     let started = Instant::now();
-    let tool_call_id = format!("sh_{}", uuid::Uuid::new_v4().simple());
+    let tool_call_id = format!("sh_{}", Uuid::new_v4().simple());
     let tool_args = serde_json::json!({ "command": command });
 
     send_tool_status_to_channels(state, session_key, "exec", &tool_args).await;
