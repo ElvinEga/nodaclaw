@@ -35,6 +35,13 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - Send a message with durable content such as a preference or project fact, then confirm logs show `recall_context`, `propose_memory`, and `record_outcome`.
 - Send a follow-up question that should reuse that fact and confirm logs show either `nodamem context injected into prompt` or an explicit fallback message if Nodamem had no usable context.
 
+## Write-Path Verification
+
+- To verify write quality manually, submit the same durable fact twice and confirm admission logs show a duplicate-oriented action such as `merge_into_existing_node` or `reject` instead of another durable write.
+- To verify contradiction handling, first store a preference like "the user prefers verbose release notes" and then send "the user no longer prefers verbose release notes"; the adapter should log a supersession decision and archive the older preference node.
+- To verify lesson refinement, send one strategic lesson and then a more specific version of the same guidance; the lesson service should log `refined` or `weakened` outcomes while keeping evidence and provenance attached to the updated lesson record.
+- To verify personality evolution, generate several validated outcomes with similar success or failure patterns and confirm `trait reinforcement recorded` or `trait weakening recorded` logs appear; if stable lessons already exist, `self-model refresh updated` should follow and the adapter will persist both `trait_events` and a new `self_model_snapshots` row.
+
 ## Prompt Formatting Rules
 
 - Prompt injection is formatted in `crates/nodamem-adapter/src/lib.rs` as a bounded `Verified Memory Context` section.
