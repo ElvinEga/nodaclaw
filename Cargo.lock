@@ -6834,6 +6834,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "memory-core",
+ "memory-imagination",
  "memory-ingest",
  "memory-store",
  "serde",

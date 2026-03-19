@@ -1,12 +1,17 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use {
     agent_api::{
-        AgentApiService, OutcomeRecordDto, ProposeMemoryRequest, RecallContextRequest,
-        RecordOutcomeRequest, adapters::openclaw::compact_recall_context,
+        AgentApiService, GenerateImaginedScenariosRequest, OutcomeRecordDto, ProposeMemoryRequest,
+        RecallContextRequest, RecordOutcomeRequest, adapters::openclaw::compact_recall_context,
     },
     chrono::Utc,
-    memory_core::{Edge, MemoryPacket, MemoryStatus, Node, NodeId},
+    memory_core::{Edge, MemoryPacket, MemoryStatus, Node, NodeId, NodeType},
+    memory_imagination::{ImaginationService, ScenarioReviewDecision},
     memory_ingest::{AdmissionContext, IngestEvent, MessageEvent},
     memory_store::{StoreConfig, StoreRuntime},
     tokio::sync::Mutex,
@@ -24,13 +29,17 @@ pub struct RecallRequest {
     pub text: String,
     pub session_id: Option<String>,
     pub topic: Option<String>,
+    pub include_hypothetical: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallResult {
     pub prompt_context: String,
+    pub verified_prompt_context: String,
+    pub hypothetical_prompt_context: Option<String>,
     pub packet: MemoryPacket,
     pub source_node_ids: Vec<NodeId>,
+    pub imagined_scenario_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +75,18 @@ pub struct OutcomeFeedbackResult {
     pub update_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImaginedScenarioFeedbackRequest {
+    pub scenario_ids: Vec<String>,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImaginedScenarioFeedbackResult {
+    pub reviewed_count: usize,
+    pub missing_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptMemoryFormatConfig {
     pub max_chars: usize,
@@ -85,6 +106,25 @@ impl Default for PromptMemoryFormatConfig {
             max_general_memories: 2,
             max_traits: 3,
             include_checkpoint: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptImaginationFormatConfig {
+    pub max_chars: usize,
+    pub max_scenarios: usize,
+    pub max_outcomes_per_scenario: usize,
+    pub include_strategy_continuity: bool,
+}
+
+impl Default for PromptImaginationFormatConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: 700,
+            max_scenarios: 2,
+            max_outcomes_per_scenario: 2,
+            include_strategy_continuity: true,
         }
     }
 }
@@ -169,8 +209,67 @@ impl NodamemAdapter {
         })?;
 
         let compact = compact_recall_context(response.clone());
-        let prompt_context =
+        let verified_prompt_context =
             format_prompt_memory_context(&compact, PromptMemoryFormatConfig::default());
+        let mut hypothetical_prompt_context = None;
+        let mut imagined_scenario_ids = Vec::new();
+
+        if request.include_hypothetical {
+            match self
+                .service
+                .generate_imagined_scenarios(&GenerateImaginedScenariosRequest {
+                    planning_task: request.text.clone(),
+                    desired_scenarios: PromptImaginationFormatConfig::default().max_scenarios,
+                    context_packet: response.packet.clone(),
+                    active_goal_node_ids: response
+                        .packet
+                        .nodes
+                        .iter()
+                        .filter(|node| node.node_type == NodeType::Goal)
+                        .map(|node| node.id)
+                        .collect(),
+                }) {
+                Ok(imagined_response) => {
+                    if !imagined_response.scenarios.is_empty() {
+                        let runtime = self.runtime.lock().await;
+                        for scenario in &imagined_response.scenarios {
+                            if let Err(error) = runtime
+                                .repository()
+                                .upsert_imagined_scenario(scenario)
+                                .await
+                            {
+                                warn!(
+                                    session_id = request.session_id.as_deref().unwrap_or(""),
+                                    %error,
+                                    scenario_id = %scenario.id.0,
+                                    "nodamem imagined scenario persistence failed"
+                                );
+                                continue;
+                            }
+                            imagined_scenario_ids.push(scenario.id.0.to_string());
+                        }
+                        drop(runtime);
+                        hypothetical_prompt_context = format_prompt_imagination_context(
+                            &imagined_response.scenarios,
+                            response.packet.self_model_snapshot.as_ref(),
+                            PromptImaginationFormatConfig::default(),
+                        );
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        session_id = request.session_id.as_deref().unwrap_or(""),
+                        %error,
+                        "nodamem imagined scenario generation failed; continuing with verified context only"
+                    );
+                },
+            }
+        }
+
+        let prompt_context = match hypothetical_prompt_context.as_deref() {
+            Some(hypothetical) => format!("{verified_prompt_context}\n\n{hypothetical}"),
+            None => verified_prompt_context.clone(),
+        };
         let source_node_ids = response.packet.nodes.iter().map(|node| node.id).collect();
         debug!(
             session_id = request.session_id.as_deref().unwrap_or(""),
@@ -178,14 +277,19 @@ impl NodamemAdapter {
             lesson_count = response.packet.lessons.len(),
             checkpoint_count = response.packet.checkpoints.len(),
             trait_count = response.packet.traits.len(),
+            imagined_scenario_count = imagined_scenario_ids.len(),
+            hypothetical_included = hypothetical_prompt_context.is_some(),
             prompt_chars = prompt_context.len(),
             "nodamem recall_context produced prompt context"
         );
 
         Ok(Some(RecallResult {
             prompt_context,
+            verified_prompt_context,
+            hypothetical_prompt_context,
             packet: response.packet,
             source_node_ids,
+            imagined_scenario_ids,
         }))
     }
 
@@ -354,6 +458,60 @@ impl NodamemAdapter {
 
         Ok(result)
     }
+
+    pub async fn review_imagined_scenarios(
+        &self,
+        request: &ImaginedScenarioFeedbackRequest,
+    ) -> anyhow::Result<ImaginedScenarioFeedbackResult> {
+        if request.scenario_ids.is_empty() {
+            return Ok(ImaginedScenarioFeedbackResult {
+                reviewed_count: 0,
+                missing_count: 0,
+            });
+        }
+
+        let decision = if request.accepted {
+            ScenarioReviewDecision::AcceptAsHypothesis
+        } else {
+            ScenarioReviewDecision::Reject
+        };
+        let reviewer = ImaginationService::default();
+        let runtime = self.runtime.lock().await;
+        let mut reviewed_count = 0;
+        let mut missing_count = 0;
+
+        for scenario_id in &request.scenario_ids {
+            let Ok(parsed) = uuid::Uuid::parse_str(scenario_id) else {
+                missing_count += 1;
+                continue;
+            };
+            let Some(existing) = runtime
+                .repository()
+                .load_imagined_scenario(memory_core::ScenarioId(parsed))
+                .await?
+            else {
+                missing_count += 1;
+                continue;
+            };
+
+            let reviewed = reviewer.review_scenario(&existing, decision);
+            runtime
+                .repository()
+                .upsert_imagined_scenario(&reviewed)
+                .await?;
+            reviewed_count += 1;
+        }
+
+        debug!(
+            accepted = request.accepted,
+            reviewed_count, missing_count, "nodamem imagined scenario review completed"
+        );
+
+        Ok(ImaginedScenarioFeedbackResult {
+            reviewed_count,
+            missing_count,
+        })
+    }
 }
 
 async fn load_snapshot(runtime: &StoreRuntime) -> anyhow::Result<StoreSnapshot> {
@@ -484,6 +642,63 @@ fn format_prompt_memory_context(
     trim_to_configured_length(lines, config.max_chars)
 }
 
+fn format_prompt_imagination_context(
+    scenarios: &[memory_core::ImaginedScenario],
+    self_model: Option<&memory_core::SelfModel>,
+    config: PromptImaginationFormatConfig,
+) -> Option<String> {
+    if scenarios.is_empty() || config.max_chars == 0 || config.max_scenarios == 0 {
+        return None;
+    }
+
+    let mut seen = HashSet::new();
+    let mut lines = vec![
+        "## Hypothetical Planning Scenarios".to_owned(),
+        String::new(),
+        "Use only for planning, brainstorming, or future-oriented reasoning. These are hypotheses, not verified facts.".to_owned(),
+    ];
+
+    if config.include_strategy_continuity {
+        if let Some(strategy_line) = summarize_self_model_for_strategy(self_model) {
+            lines.push(String::new());
+            lines.push(format!("Strategy continuity: {strategy_line}"));
+        }
+    }
+
+    for scenario in scenarios.iter().take(config.max_scenarios) {
+        let summary = truncate_line(
+            &format!(
+                "{} [{} | plausible {:.2} | useful {:.2}]: {}",
+                scenario.title.trim(),
+                imagination_kind_label(scenario.kind),
+                scenario.plausibility_score,
+                scenario.usefulness_score,
+                scenario.premise.trim()
+            ),
+            220,
+        );
+        if let Some(summary) = dedupe_text_allowing_hypothetical(&mut seen, summary) {
+            lines.push(String::new());
+            lines.push(format!("- {summary}"));
+        }
+
+        let outcome_lines = scenario
+            .predicted_outcomes
+            .iter()
+            .filter_map(|outcome| {
+                let line = truncate_line(outcome, 140);
+                dedupe_text_allowing_hypothetical(&mut seen, line)
+            })
+            .take(config.max_outcomes_per_scenario)
+            .collect::<Vec<_>>();
+        for outcome in outcome_lines {
+            lines.push(format!("  Outcome: {outcome}"));
+        }
+    }
+
+    Some(trim_to_configured_length(lines, config.max_chars))
+}
+
 fn trim_to_configured_length(mut lines: Vec<String>, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -529,12 +744,83 @@ fn format_memory_line(title: &str, summary: &str) -> String {
     }
 }
 
+fn summarize_self_model_for_strategy(
+    self_model: Option<&memory_core::SelfModel>,
+) -> Option<String> {
+    let self_model = self_model?;
+    let strengths = self_model
+        .recurring_strengths
+        .iter()
+        .filter_map(|value| summarize_phrase(value, 5))
+        .take(1);
+    let preferences = self_model
+        .user_interaction_preferences
+        .iter()
+        .filter_map(|value| summarize_phrase(value, 6))
+        .take(1);
+    let tendencies = self_model
+        .behavioral_tendencies
+        .iter()
+        .filter_map(|value| summarize_phrase(value, 6))
+        .take(1);
+    let domains = self_model
+        .active_domains
+        .iter()
+        .filter_map(|value| summarize_phrase(value, 4))
+        .take(1);
+
+    let phrases = strengths
+        .chain(preferences)
+        .chain(tendencies)
+        .chain(domains)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(3)
+        .collect::<Vec<_>>();
+    if phrases.is_empty() {
+        None
+    } else {
+        Some(phrases.join("; "))
+    }
+}
+
+fn summarize_phrase(value: &str, max_words: usize) -> Option<String> {
+    let compact = value
+        .trim()
+        .split_whitespace()
+        .take(max_words)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        None
+    } else {
+        Some(compact)
+    }
+}
+
+fn imagination_kind_label(kind: memory_core::ImaginedScenarioKind) -> &'static str {
+    match kind {
+        memory_core::ImaginedScenarioKind::FutureNeedPrediction => "future need",
+        memory_core::ImaginedScenarioKind::AlternativePlan => "alternative plan",
+        memory_core::ImaginedScenarioKind::Counterfactual => "counterfactual",
+    }
+}
+
 fn dedupe_text(seen: &mut HashSet<String>, text: String) -> Option<String> {
     let dedupe_keys = dedupe_keys(&text);
     if dedupe_keys.is_empty()
         || dedupe_keys.iter().any(|key| is_hypothetical_text(key))
         || dedupe_keys.iter().any(|key| seen.contains(key))
     {
+        return None;
+    }
+    seen.extend(dedupe_keys);
+    Some(text)
+}
+
+fn dedupe_text_allowing_hypothetical(seen: &mut HashSet<String>, text: String) -> Option<String> {
+    let dedupe_keys = dedupe_keys(&text);
+    if dedupe_keys.is_empty() || dedupe_keys.iter().any(|key| seen.contains(key)) {
         return None;
     }
     seen.extend(dedupe_keys);
@@ -652,7 +938,10 @@ mod tests {
             OpenClawLessonSummary, OpenClawNodeSummary, OpenClawRecallContextResponse,
             OpenClawTraitSummary,
         },
-        memory_core::{LessonType, TraitType},
+        memory_core::{
+            ImaginationStatus, ImaginedScenario, ImaginedScenarioKind, LessonType, SelfModel,
+            TraitType,
+        },
         tempfile::TempDir,
         uuid::Uuid,
     };
@@ -684,6 +973,7 @@ mod tests {
                 text: "release notes preference".to_owned(),
                 session_id: Some("session-1".to_owned()),
                 topic: Some("preferences".to_owned()),
+                include_hypothetical: false,
             })
             .await
             .expect("recall should succeed")
@@ -745,7 +1035,7 @@ mod tests {
             .expect("nodes should load");
         let preference_nodes = nodes
             .into_iter()
-            .filter(|node| node.node_type == memory_core::NodeType::Preference)
+            .filter(|node| node.node_type == NodeType::Preference)
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -965,5 +1255,176 @@ mod tests {
             formatted,
             "## Verified Memory Context\n\nNo verified memory available."
         );
+    }
+
+    #[test]
+    fn prompt_context_keeps_verified_and_hypothetical_sections_separate() {
+        let hypothetical = format_prompt_imagination_context(
+            &[sample_imagined_scenario()],
+            Some(&sample_self_model()),
+            PromptImaginationFormatConfig::default(),
+        )
+        .expect("hypothetical section should exist");
+
+        assert!(hypothetical.contains("## Hypothetical Planning Scenarios"));
+        assert!(hypothetical.contains("not verified facts"));
+        assert!(!hypothetical.contains("## Verified Memory Context"));
+    }
+
+    #[test]
+    fn hypothetical_formatter_uses_self_model_without_raw_dump() {
+        let formatted = format_prompt_imagination_context(
+            &[sample_imagined_scenario()],
+            Some(&sample_self_model()),
+            PromptImaginationFormatConfig::default(),
+        )
+        .expect("hypothetical section should exist");
+
+        assert!(formatted.contains("Strategy continuity:"));
+        assert!(!formatted.contains("supporting_lesson_ids"));
+        assert!(!formatted.contains("version"));
+        assert!(!formatted.contains("00000000"));
+    }
+
+    #[test]
+    fn hypothetical_formatter_does_not_present_scenarios_as_verified_memory() {
+        let formatted = format_prompt_imagination_context(
+            &[sample_imagined_scenario()],
+            None,
+            PromptImaginationFormatConfig::default(),
+        )
+        .expect("hypothetical section should exist");
+
+        assert!(formatted.contains("hypotheses, not verified facts"));
+        assert!(!formatted.contains("Validated lessons:"));
+        assert!(!formatted.contains("Other verified context:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn imagined_scenarios_can_be_reviewed_after_prompt_use() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("session-4".to_owned()),
+                user_text: "Remember the current goal is to plan a staged release.".to_owned(),
+                assistant_text: "Noted. The current goal is a staged release plan.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("goal proposal should succeed");
+
+        let recall = adapter
+            .recall_context(&RecallRequest {
+                text: "brainstorm options for the next staged release".to_owned(),
+                session_id: Some("session-4".to_owned()),
+                topic: Some("planning".to_owned()),
+                include_hypothetical: true,
+            })
+            .await
+            .expect("recall should succeed")
+            .expect("recall should return context");
+
+        assert!(recall.hypothetical_prompt_context.is_some());
+        assert!(!recall.imagined_scenario_ids.is_empty());
+
+        let review = adapter
+            .review_imagined_scenarios(&ImaginedScenarioFeedbackRequest {
+                scenario_ids: recall.imagined_scenario_ids.clone(),
+                accepted: true,
+            })
+            .await
+            .expect("review should succeed");
+        assert_eq!(review.reviewed_count, recall.imagined_scenario_ids.len());
+
+        let runtime = adapter.runtime.lock().await;
+        let scenarios = runtime
+            .repository()
+            .list_imagined_scenarios(10)
+            .await
+            .expect("imagined scenarios should load");
+        assert!(scenarios.iter().all(|scenario| {
+            scenario.status == ImaginationStatus::AcceptedAsHypothesis
+                || scenario.status == ImaginationStatus::Simulated
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_context_keeps_hypothetical_block_disabled_when_not_requested() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("session-5".to_owned()),
+                user_text: "Remember the goal is to plan a careful migration.".to_owned(),
+                assistant_text: "Noted. The goal is a careful migration plan.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("goal proposal should succeed");
+
+        let recall = adapter
+            .recall_context(&RecallRequest {
+                text: "plan a careful migration".to_owned(),
+                session_id: Some("session-5".to_owned()),
+                topic: Some("planning".to_owned()),
+                include_hypothetical: false,
+            })
+            .await
+            .expect("recall should succeed")
+            .expect("recall should return context");
+
+        assert!(
+            recall
+                .verified_prompt_context
+                .contains("## Verified Memory Context")
+        );
+        assert!(recall.hypothetical_prompt_context.is_none());
+        assert!(recall.imagined_scenario_ids.is_empty());
+        assert!(
+            !recall
+                .prompt_context
+                .contains("## Hypothetical Planning Scenarios")
+        );
+    }
+
+    fn sample_imagined_scenario() -> ImaginedScenario {
+        ImaginedScenario {
+            id: memory_core::ScenarioId(Uuid::new_v4()),
+            kind: ImaginedScenarioKind::AlternativePlan,
+            status: ImaginationStatus::Simulated,
+            title: "Alternative rollout path".to_owned(),
+            premise: "If the release is staged by tenant tier, support load likely stays lower."
+                .to_owned(),
+            narrative: "A simulated option grounded in prior release coordination memory."
+                .to_owned(),
+            basis_source_node_ids: vec![NodeId(Uuid::new_v4())],
+            basis_lesson_ids: vec![],
+            active_goal_node_ids: vec![NodeId(Uuid::new_v4())],
+            trait_snapshot: vec![],
+            self_model_snapshot: None,
+            predicted_outcomes: vec![
+                "Risk falls if high-touch customers move last.".to_owned(),
+                "Coordination cost rises slightly because rollout checkpoints increase.".to_owned(),
+            ],
+            plausibility_score: 0.79,
+            novelty_score: 0.52,
+            usefulness_score: 0.83,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn sample_self_model() -> SelfModel {
+        SelfModel {
+            id: memory_core::SelfModelId(Uuid::nil()),
+            version: 7,
+            recurring_strengths: vec!["practical release planning".to_owned()],
+            user_interaction_preferences: vec!["prefer concise direct collaboration".to_owned()],
+            behavioral_tendencies: vec!["stay evidence-led when weighing options".to_owned()],
+            active_domains: vec!["release planning".to_owned()],
+            supporting_lesson_ids: vec![],
+            supporting_trait_ids: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
     }
 }

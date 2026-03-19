@@ -9,6 +9,7 @@ agent-api = { path = "../../../nodamem/agent-api" }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 memory-core = { path = "../../../nodamem/memory-core" }
+memory-imagination = { path = "../../../nodamem/memory-imagination" }
 memory-ingest = { path = "../../../nodamem/memory-ingest" }
 memory-store = { path = "../../../nodamem/memory-store" }
 serde = { workspace = true }

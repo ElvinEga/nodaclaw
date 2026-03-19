@@ -4,9 +4,9 @@
 
 Nodaclaw now opens a local Nodamem adapter from `crates/gateway/src/server.rs` and exposes it through gateway runtime state. The main integration points are:
 
-- `crates/chat/src/lib.rs`: prompt/context assembly now calls Nodamem `recall_context` and appends a compact external-memory section to the system prompt.
+- `crates/chat/src/lib.rs`: prompt/context assembly now calls Nodamem `recall_context`, keeps `## Verified Memory Context` unchanged, and conditionally appends a separate hypothetical planning block when the runtime policy detects planning or future-oriented reasoning.
 - `crates/chat/src/lib.rs`: after a meaningful assistant response, Nodamem `propose_memory` is called with a validated exchange payload.
-- `crates/chat/src/lib.rs`: after turn completion, Nodamem `record_outcome` is called for success/failure feedback.
+- `crates/chat/src/lib.rs`: after turn completion, Nodamem `record_outcome` is called for success/failure feedback, and any injected imagined scenarios are reviewed as accepted hypotheses or rejected scenarios.
 - `crates/nodamem-adapter/src/lib.rs`: all Nodamem-specific loading, conversion, and persistence logic is isolated behind the adapter.
 
 ## Old Memory Path Still Active
@@ -48,9 +48,12 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - The formatter prefers concise summary text, validated lessons, and preference or goal memories before any general context.
 - Duplicate lines are removed before prompt injection, and hypothetical or imagined wording is filtered so it is not presented as verified memory.
 - The checkpoint summary is optional, and total prompt memory length is capped through `PromptMemoryFormatConfig` to keep the injected section compact.
+- Hypothetical planning support is formatted separately as `## Hypothetical Planning Scenarios`; it is only added when the chat runtime policy detects planning, brainstorming, or future-oriented requests.
+- The hypothetical block includes a short warning that scenarios are hypotheses, not facts, plus a compact strategy-continuity line derived from the self-model without dumping raw IDs, version fields, or full internal lists.
 
 ## Imagination Notes
 
 - Grounded imagination now uses connected verified nodes, validated lessons, active goals or preferences, the current trait snapshot, and the latest self-model snapshot to build simulated scenarios.
 - Imagined scenarios are stored only in `imagined_nodes` and carried through `MemoryPacket.imagined_scenarios`; they are not promoted into verified `nodes` without a separate validation flow.
-- Manual verification: call `generate_imagined_scenarios` with a packet containing linked nodes plus a self-model snapshot and confirm logs show `scenario generation started`, `scenario scoring completed`, and `scenario generation completed`.
+- Manual verification: ask a planning-oriented question such as "brainstorm rollout options for next week" and confirm the system prompt contains both `## Verified Memory Context` and `## Hypothetical Planning Scenarios`, while a factual recall question should only include the verified block.
+- After a planning turn succeeds or fails, confirm logs show `nodamem imagined scenario review requested` followed by `nodamem imagined scenario review completed`, and inspect `imagined_nodes.status` to verify scenarios were marked `accepted_as_hypothesis` or `rejected`.
