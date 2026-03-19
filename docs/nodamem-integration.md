@@ -48,3 +48,9 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - The formatter prefers concise summary text, validated lessons, and preference or goal memories before any general context.
 - Duplicate lines are removed before prompt injection, and hypothetical or imagined wording is filtered so it is not presented as verified memory.
 - The checkpoint summary is optional, and total prompt memory length is capped through `PromptMemoryFormatConfig` to keep the injected section compact.
+
+## Imagination Notes
+
+- Grounded imagination now uses connected verified nodes, validated lessons, active goals or preferences, the current trait snapshot, and the latest self-model snapshot to build simulated scenarios.
+- Imagined scenarios are stored only in `imagined_nodes` and carried through `MemoryPacket.imagined_scenarios`; they are not promoted into verified `nodes` without a separate validation flow.
+- Manual verification: call `generate_imagined_scenarios` with a packet containing linked nodes plus a self-model snapshot and confirm logs show `scenario generation started`, `scenario scoring completed`, and `scenario generation completed`.
