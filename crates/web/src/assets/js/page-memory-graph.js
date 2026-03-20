@@ -463,14 +463,18 @@ function canArchiveItem(item) {
 	);
 }
 
-async function archiveSelectedNode(item) {
-	if (!canArchiveItem(item) || archiveBusy.value) return;
-	var reason = window.prompt("Archive reason", "archived from graph ui");
+function canUnarchiveItem(item) {
+	return Boolean(item && item.kind === "node" && item.node_type !== "imagined" && item.status === "archived");
+}
+
+async function postNodeAction(item, actionPath, defaultReason, failureMessage) {
+	if (archiveBusy.value) return;
+	var reason = window.prompt("Reason", defaultReason);
 	if (reason === null) return;
 	archiveBusy.value = true;
 	archiveError.value = "";
 	try {
-		await fetchJson(`/api/nodamem/graph/nodes/${encodeURIComponent(item.id)}/archive`, {
+		await fetchJson(`/api/nodamem/graph/nodes/${encodeURIComponent(item.id)}/${actionPath}`, {
 			method: "POST",
 			body: JSON.stringify({ reason }),
 		});
@@ -478,10 +482,20 @@ async function archiveSelectedNode(item) {
 		selectedId.value = item.id;
 		selectedDetail.value = await fetchJson(`/api/nodamem/graph/nodes/${encodeURIComponent(item.id)}`);
 	} catch (err) {
-		archiveError.value = err?.message || "Failed to archive node";
+		archiveError.value = err?.message || failureMessage;
 	} finally {
 		archiveBusy.value = false;
 	}
+}
+
+async function archiveSelectedNode(item) {
+	if (!canArchiveItem(item)) return;
+	await postNodeAction(item, "archive", "archived from graph ui", "Failed to archive node");
+}
+
+async function unarchiveSelectedNode(item) {
+	if (!canUnarchiveItem(item)) return;
+	await postNodeAction(item, "unarchive", "restored from graph ui", "Failed to restore node");
 }
 
 function centerOnNode(nodeId, layout, viewportWidth, viewportHeight) {
@@ -939,6 +953,23 @@ function NodeActionPanel({ item, graph, data }) {
 		</div>`;
 	}
 
+	if (selectedNodePanel.value === "timeline") {
+		return html`<div class="space-y-2 text-sm">
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)]">Node timeline</div>
+			${detail.timeline_events?.length
+				? detail.timeline_events.map(
+						(event, index) => html`<div key=${`timeline:${index}`} class="rounded border border-[var(--border)] bg-[var(--surface2)] px-3 py-2">
+							<div class="flex items-center justify-between gap-3">
+								<div class="text-xs text-[var(--text-strong)]">${event.label}</div>
+								<div class="text-[11px] text-[var(--muted)]">${new Date(event.occurred_at).toLocaleString()}</div>
+							</div>
+							<div class="mt-1 text-xs text-[var(--text)]">${compact(event.detail, 100)}</div>
+						</div>`,
+					)
+				: html`<div class="text-xs text-[var(--muted)]">No timeline events available.</div>`}
+		</div>`;
+	}
+
 	return html`<div class="space-y-3 text-sm">
 		<div class="text-xs uppercase tracking-wide text-[var(--muted)]">Provenance and evidence</div>
 		<div class="text-xs text-[var(--muted)]">state: ${nodeStateSummary(detail)}</div>
@@ -1080,13 +1111,23 @@ function Sidebar() {
 				${item?.kind === "node"
 					? html`<button
 						class="provider-btn provider-btn-secondary provider-btn-sm"
-						disabled=${archiveBusy.value || !canArchiveItem(item)}
+						disabled=${archiveBusy.value || (!canArchiveItem(item) && !canUnarchiveItem(item))}
 						title=${canArchiveItem(item)
 							? "Archive this verified node"
-							: "Only active verified nodes can be archived from this view"}
-						onClick=${() => archiveSelectedNode(item)}
+							: canUnarchiveItem(item)
+								? "Restore this archived verified node"
+								: "Only verified nodes with supported lifecycle states can be changed from this view"}
+						onClick=${() => (canArchiveItem(item) ? archiveSelectedNode(item) : unarchiveSelectedNode(item))}
 					>
-						${archiveBusy.value ? "Archiving..." : canArchiveItem(item) ? "Archive node" : "Archive unavailable"}
+						${archiveBusy.value
+							? canUnarchiveItem(item)
+								? "Restoring..."
+								: "Archiving..."
+							: canArchiveItem(item)
+								? "Archive node"
+								: canUnarchiveItem(item)
+									? "Restore node"
+									: "Action unavailable"}
 					</button>`
 					: null}
 			</div>
@@ -1101,6 +1142,7 @@ function Sidebar() {
 							["lessons", "Lessons"],
 							["history", "History"],
 							["neighbors", "Neighbors"],
+							["timeline", "Timeline"],
 						].map(
 							([value, label]) => html`<button
 								key=${`panel:${value}`}
