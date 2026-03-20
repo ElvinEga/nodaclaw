@@ -236,6 +236,7 @@ pub struct GraphInspectionNodeDetail {
     pub reasons: Vec<String>,
     pub lesson_links: Vec<GraphInspectionLessonLink>,
     pub related_nodes: Vec<GraphInspectionRelatedNode>,
+    pub timeline_events: Vec<GraphInspectionTimelineEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -252,6 +253,14 @@ pub struct GraphInspectionRelatedNode {
     pub relation: &'static str,
     pub node_type: NodeType,
     pub status: MemoryStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GraphInspectionTimelineEvent {
+    pub event_kind: String,
+    pub label: String,
+    pub detail: String,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -722,6 +731,8 @@ impl NodamemAdapter {
             return Ok(None);
         };
         let related_nodes = repository.get_neighbors(node_id).await?;
+        let action_events = repository.load_node_action_events(node_id, 20).await?;
+        let timeline_events = build_node_timeline_events(&audit, &action_events);
 
         let detail =
             GraphInspectionNodeDetail {
@@ -755,6 +766,7 @@ impl NodamemAdapter {
                         status: node.status,
                     })
                     .collect(),
+                timeline_events,
                 node: audit.node,
             };
 
@@ -792,6 +804,33 @@ impl NodamemAdapter {
         Ok(ArchiveNodeResult {
             node_id: archived.id.0.to_string(),
             status: archived.status,
+            reason: reason.trim().to_owned(),
+        })
+    }
+
+    pub async fn unarchive_graph_node_by_id(
+        &self,
+        node_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<ArchiveNodeResult> {
+        let parsed = NodeId(Uuid::parse_str(node_id.trim())?);
+        let runtime = self.runtime.lock().await;
+        let repository = runtime.repository();
+        let restored = repository
+            .unarchive_node(parsed, reason)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+
+        info!(
+            node_id = %restored.id.0,
+            node_type = ?restored.node_type,
+            reason = reason.trim(),
+            "nodamem graph node restored"
+        );
+
+        Ok(ArchiveNodeResult {
+            node_id: restored.id.0.to_string(),
+            status: restored.status,
             reason: reason.trim().to_owned(),
         })
     }
@@ -1499,6 +1538,65 @@ fn trait_type_label(trait_type: memory_core::TraitType) -> &'static str {
         memory_core::TraitType::Practicality => "practicality",
         memory_core::TraitType::Proactivity => "proactivity",
     }
+}
+
+fn build_node_timeline_events(
+    audit: &memory_store::audit::NodeAuditTrail,
+    action_events: &[memory_store::repository::NodeActionEvent],
+) -> Vec<GraphInspectionTimelineEvent> {
+    let mut events = vec![GraphInspectionTimelineEvent {
+        event_kind: "created".to_owned(),
+        label: "Created".to_owned(),
+        detail: audit
+            .node
+            .source_event_id
+            .as_ref()
+            .map_or_else(|| "Node created".to_owned(), |event| format!("source event: {event}")),
+        occurred_at: audit.node.created_at.to_rfc3339(),
+    }];
+
+    for reason in &audit.reasons {
+        let lower = reason.to_lowercase();
+        let event_kind = if lower.contains("reinforc") {
+            Some(("reinforced", "Reinforced"))
+        } else if lower.contains("refin") {
+            Some(("refined", "Refined"))
+        } else if lower.contains("weaken") || lower.contains("contradict") {
+            Some(("weakened", "Weakened"))
+        } else if lower.contains("supersed") {
+            Some(("superseded", "Superseded"))
+        } else {
+            None
+        };
+
+        if let Some((kind, label)) = event_kind {
+            if !events.iter().any(|event| event.event_kind == kind) {
+                events.push(GraphInspectionTimelineEvent {
+                    event_kind: kind.to_owned(),
+                    label: label.to_owned(),
+                    detail: reason.clone(),
+                    occurred_at: audit.node.updated_at.to_rfc3339(),
+                });
+            }
+        }
+    }
+
+    for action in action_events.iter().rev() {
+        let label = match action.event_type.as_str() {
+            "archived" => "Archived",
+            "unarchived" => "Unarchived",
+            _ => "Updated",
+        };
+        events.push(GraphInspectionTimelineEvent {
+            event_kind: action.event_type.clone(),
+            label: label.to_owned(),
+            detail: action.reason.clone(),
+            occurred_at: action.created_at.to_rfc3339(),
+        });
+    }
+
+    events.sort_by(|left, right| left.occurred_at.cmp(&right.occurred_at));
+    events
 }
 
 fn dedupe_text(seen: &mut HashSet<String>, text: String) -> Option<String> {
@@ -2418,6 +2516,183 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("archived but kept for audit")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_node_unarchive_action_succeeds() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("restore-session".to_owned()),
+                user_text: "Remember the user prefers terse release notes.".to_owned(),
+                assistant_text: "I will keep release notes terse.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "temporary archive")
+            .await
+            .expect("archive should succeed");
+        let result = adapter
+            .unarchive_graph_node_by_id(&node_id.0.to_string(), "restored after review")
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(result.node_id, node_id.0.to_string());
+        assert_eq!(result.status, MemoryStatus::Active);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unarchived_status_is_reflected_in_inspection_output() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("restore-detail-session".to_owned()),
+                user_text: "Remember the user prefers succinct rollback notes.".to_owned(),
+                assistant_text: "I will keep rollback notes succinct.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "temporary archive")
+            .await
+            .expect("archive should succeed");
+        adapter
+            .unarchive_graph_node_by_id(&node_id.0.to_string(), "restored after validation")
+            .await
+            .expect("restore should succeed");
+
+        let detail = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        assert_eq!(detail.node.status, MemoryStatus::Active);
+        assert!(detail
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("recent node event: unarchived (restored after validation)")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_and_unarchive_history_is_preserved_in_timeline() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("timeline-session".to_owned()),
+                user_text: "Remember the user prefers plain incident summaries.".to_owned(),
+                assistant_text: "I will keep incident summaries plain.".to_owned(),
+                event_id: "timeline-created-event".to_owned(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "archived from graph review")
+            .await
+            .expect("archive should succeed");
+        adapter
+            .unarchive_graph_node_by_id(&node_id.0.to_string(), "restored for active use")
+            .await
+            .expect("restore should succeed");
+
+        let detail = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        let labels = detail
+            .timeline_events
+            .iter()
+            .map(|event| event.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"Created"));
+        assert!(labels.contains(&"Archived"));
+        assert!(labels.contains(&"Unarchived"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeline_uses_existing_audit_and_history_data() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("timeline-audit-session".to_owned()),
+                user_text: "Remember the user prefers crisp migration updates.".to_owned(),
+                assistant_text: "I will keep migration updates crisp.".to_owned(),
+                event_id: "timeline-audit-event".to_owned(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "superseded by newer note style")
+            .await
+            .expect("archive should succeed");
+
+        let detail = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        assert!(detail
+            .timeline_events
+            .iter()
+            .any(|event| event.label == "Created" && event.detail.contains("timeline-audit-event")));
+        assert!(detail
+            .timeline_events
+            .iter()
+            .any(|event| event.label == "Archived" && event.detail.contains("superseded by newer note style")));
     }
 
     fn sample_imagined_scenario() -> ImaginedScenario {
