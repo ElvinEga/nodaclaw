@@ -89,6 +89,13 @@ pub struct ImaginedScenarioFeedbackResult {
     pub missing_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveNodeResult {
+    pub node_id: String,
+    pub status: MemoryStatus,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptMemoryFormatConfig {
     pub max_chars: usize,
@@ -760,6 +767,33 @@ impl NodamemAdapter {
     ) -> anyhow::Result<Option<GraphInspectionNodeDetail>> {
         let parsed = NodeId(Uuid::parse_str(node_id.trim())?);
         self.inspect_graph_node(parsed).await
+    }
+
+    pub async fn archive_graph_node_by_id(
+        &self,
+        node_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<ArchiveNodeResult> {
+        let parsed = NodeId(Uuid::parse_str(node_id.trim())?);
+        let runtime = self.runtime.lock().await;
+        let repository = runtime.repository();
+        let archived = repository
+            .archive_node(parsed, reason)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+
+        info!(
+            node_id = %archived.id.0,
+            node_type = ?archived.node_type,
+            reason = reason.trim(),
+            "nodamem graph node archived"
+        );
+
+        Ok(ArchiveNodeResult {
+            node_id: archived.id.0.to_string(),
+            status: archived.status,
+            reason: reason.trim().to_owned(),
+        })
     }
 
     pub async fn run_evaluation_harness_at(
@@ -2216,6 +2250,174 @@ mod tests {
 
         assert!(!detail.summary.is_empty());
         assert_eq!(detail.node.id, node_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_node_archive_action_succeeds() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("archive-session".to_owned()),
+                user_text: "Remember the user prefers weekly release notes.".to_owned(),
+                assistant_text: "I will keep that preference in mind.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        let result = adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "archived from graph ui")
+            .await
+            .expect("archive should succeed");
+
+        assert_eq!(result.node_id, node_id.0.to_string());
+        assert_eq!(result.status, MemoryStatus::Archived);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archived_node_status_is_reflected_in_inspection_output() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("archive-detail-session".to_owned()),
+                user_text: "Remember the user prefers direct status updates.".to_owned(),
+                assistant_text: "I will keep status updates direct.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "replaced by newer preference")
+            .await
+            .expect("archive should succeed");
+
+        let detail = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        assert_eq!(detail.node.status, MemoryStatus::Archived);
+        assert!(detail
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("recent node event: archived (replaced by newer preference)")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archived_node_remains_visible_in_graph_snapshot_and_history() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("archive-history-session".to_owned()),
+                user_text: "Remember the user prefers concise sprint recaps.".to_owned(),
+                assistant_text: "I will keep sprint recaps concise.".to_owned(),
+                event_id: Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let initial = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = initial
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "archived after manual review")
+            .await
+            .expect("archive should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+
+        assert!(snapshot
+            .nodes
+            .iter()
+            .any(|node| node.id == node_id && node.status == MemoryStatus::Archived));
+        assert!(snapshot
+            .superseded_history
+            .iter()
+            .any(|node| node.id == node_id && node.status == MemoryStatus::Archived));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_preserves_node_provenance_and_audit_trail() {
+        let (adapter, _dir) = open_test_adapter().await;
+        adapter
+            .propose_memory(&MemoryProposalRequest {
+                session_id: Some("archive-audit-session".to_owned()),
+                user_text: "Remember the user prefers compact rollout notes.".to_owned(),
+                assistant_text: "I will keep rollout notes compact.".to_owned(),
+                event_id: "archive-audit-event".to_owned(),
+            })
+            .await
+            .expect("proposal should succeed");
+
+        let snapshot = adapter
+            .inspect_graph_snapshot()
+            .await
+            .expect("graph snapshot should load");
+        let node_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_type == NodeType::Preference)
+            .expect("snapshot should contain preference node")
+            .id;
+
+        let before = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        adapter
+            .archive_graph_node_by_id(&node_id.0.to_string(), "archived but kept for audit")
+            .await
+            .expect("archive should succeed");
+
+        let after = adapter
+            .inspect_graph_node(node_id)
+            .await
+            .expect("node detail should load")
+            .expect("node detail should exist");
+
+        assert_eq!(before.source_event_id, after.source_event_id);
+        assert_eq!(after.source_event_id.as_deref(), Some("archive-audit-event"));
+        assert!(after
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("archived but kept for audit")));
     }
 
     fn sample_imagined_scenario() -> ImaginedScenario {
