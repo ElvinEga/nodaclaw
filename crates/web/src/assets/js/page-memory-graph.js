@@ -15,10 +15,22 @@ var imaginedOnly = signal(false);
 var neighborhoodOnly = signal(false);
 var searchQuery = signal("");
 var hideWeakNodes = signal(false);
+var selectedClusterId = signal("all");
 var graphZoom = signal(1);
 var graphPanX = signal(0);
 var graphPanY = signal(0);
+var hoveredPreview = signal(null);
+var hoveredEdgeId = signal("");
 var containerRef = null;
+
+var CLUSTER_COLORS = [
+	{ stroke: "#2563eb", fill: "rgba(37,99,235,0.08)", chip: "rgba(37,99,235,0.12)" },
+	{ stroke: "#16a34a", fill: "rgba(22,163,74,0.08)", chip: "rgba(22,163,74,0.12)" },
+	{ stroke: "#d97706", fill: "rgba(217,119,6,0.08)", chip: "rgba(217,119,6,0.12)" },
+	{ stroke: "#7c3aed", fill: "rgba(124,58,237,0.08)", chip: "rgba(124,58,237,0.12)" },
+	{ stroke: "#db2777", fill: "rgba(219,39,119,0.08)", chip: "rgba(219,39,119,0.12)" },
+	{ stroke: "#0891b2", fill: "rgba(8,145,178,0.08)", chip: "rgba(8,145,178,0.12)" },
+];
 
 async function fetchJson(url) {
 	var res = await fetch(url, {
@@ -107,20 +119,6 @@ function matchesSearch(item) {
 		.join(" ")
 		.toLowerCase();
 	return haystack.includes(query);
-}
-
-function isVisibleItem(item, allowedIds) {
-	if (allowedIds && !allowedIds.has(item.id)) return false;
-	if (!matchesSearch(item)) return false;
-	if (hideWeakNodes.value && isWeakNode(item)) return false;
-	if (imaginedOnly.value) return item.kind === "imagined";
-	if (filterStatus.value === "active" && statusBucket(item) !== "active") return false;
-	if (filterStatus.value === "archived" && statusBucket(item) !== "archived") return false;
-	if (filterStatus.value === "imagined" && item.kind !== "imagined") return false;
-	if (filterNodeType.value !== "all" && item.kind === "node" && item.node_type !== filterNodeType.value) {
-		return false;
-	}
-	return true;
 }
 
 function buildItems(data) {
@@ -222,14 +220,119 @@ function buildNeighborhood(edges, focusId) {
 	return allowed;
 }
 
+function clusterLabel(items) {
+	var counts = new Map();
+	items.forEach((item) => {
+		var key = kindLabel(item);
+		counts.set(key, (counts.get(key) || 0) + 1);
+	});
+	var dominant = Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || "mixed";
+	return `${dominant} cluster`;
+}
+
+function analyzeClusters(items, edges) {
+	var byItemId = {};
+	var adjacency = new Map(items.map((item) => [item.id, new Set()]));
+	edges.forEach((edge) => {
+		if (!adjacency.has(edge.from) || !adjacency.has(edge.to)) return;
+		adjacency.get(edge.from).add(edge.to);
+		adjacency.get(edge.to).add(edge.from);
+	});
+
+	var remaining = new Set(items.map((item) => item.id));
+	var clusters = [];
+	var index = 0;
+
+	while (remaining.size > 0) {
+		var start = remaining.values().next().value;
+		var stack = [start];
+		var ids = [];
+		remaining.delete(start);
+		while (stack.length) {
+			var current = stack.pop();
+			ids.push(current);
+			(adjacency.get(current) || new Set()).forEach((next) => {
+				if (!remaining.has(next)) return;
+				remaining.delete(next);
+				stack.push(next);
+			});
+		}
+
+		var clusterItems = ids
+			.map((id) => items.find((item) => item.id === id))
+			.filter(Boolean);
+		var color = CLUSTER_COLORS[index % CLUSTER_COLORS.length];
+		var cluster = {
+			id: `cluster:${index + 1}`,
+			index,
+			size: clusterItems.length,
+			label: clusterLabel(clusterItems),
+			itemIds: ids,
+			color,
+		};
+		clusterItems.forEach((item) => {
+			byItemId[item.id] = cluster.id;
+		});
+		clusters.push(cluster);
+		index += 1;
+	}
+
+	clusters.sort((a, b) => b.size - a.size);
+	clusters.forEach((cluster, order) => {
+		cluster.index = order;
+		cluster.color = CLUSTER_COLORS[order % CLUSTER_COLORS.length];
+	});
+	return { clusters, byItemId };
+}
+
+function isVisibleItem(item, allowedIds) {
+	if (allowedIds && !allowedIds.has(item.id)) return false;
+	if (!matchesSearch(item)) return false;
+	if (hideWeakNodes.value && isWeakNode(item)) return false;
+	if (imaginedOnly.value) return item.kind === "imagined";
+	if (filterStatus.value === "active" && statusBucket(item) !== "active") return false;
+	if (filterStatus.value === "archived" && statusBucket(item) !== "archived") return false;
+	if (filterStatus.value === "imagined" && item.kind !== "imagined") return false;
+	if (filterNodeType.value !== "all" && item.kind === "node" && item.node_type !== filterNodeType.value) {
+		return false;
+	}
+	return true;
+}
+
 function visibleGraph(data) {
 	var items = buildItems(data);
 	var edges = buildEdges(data);
 	var allowed = neighborhoodOnly.value ? buildNeighborhood(edges, selectedId.value) : null;
-	var visibleItems = items.filter((item) => isVisibleItem(item, allowed));
-	var visibleIds = new Set(visibleItems.map((item) => item.id));
-	var visibleEdges = edges.filter((edge) => visibleIds.has(edge.from) && visibleIds.has(edge.to));
-	return { items: visibleItems, edges: visibleEdges };
+	var baseItems = items.filter((item) => isVisibleItem(item, allowed));
+	var baseIds = new Set(baseItems.map((item) => item.id));
+	var baseEdges = edges.filter((edge) => baseIds.has(edge.from) && baseIds.has(edge.to));
+	var clusterInfo = analyzeClusters(baseItems, baseEdges);
+
+	if (selectedClusterId.value !== "all") {
+		var selectedCluster = clusterInfo.clusters.find((cluster) => cluster.id === selectedClusterId.value);
+		if (selectedCluster) {
+			var clusterIds = new Set(selectedCluster.itemIds);
+			var itemsInCluster = baseItems.filter((item) => clusterIds.has(item.id));
+			var edgesInCluster = baseEdges.filter((edge) => clusterIds.has(edge.from) && clusterIds.has(edge.to));
+			return {
+				items: itemsInCluster,
+				edges: edgesInCluster,
+				clusters: clusterInfo.clusters,
+				allClusters: clusterInfo.clusters,
+				clusterByItemId: clusterInfo.byItemId,
+				activeClusterId: selectedCluster.id,
+			};
+		}
+	}
+
+	return {
+		items: baseItems,
+		edges: baseEdges,
+		clusters: clusterInfo.clusters,
+		allClusters: clusterInfo.clusters,
+		clusterByItemId: clusterInfo.byItemId,
+		activeClusterId: "all",
+	};
 }
 
 function laneFor(item) {
@@ -240,39 +343,57 @@ function laneFor(item) {
 	return 1;
 }
 
-function compareItems(a, b) {
+function compareItems(a, b, clusterByItemId, clusterOrder) {
+	var clusterA = clusterOrder.get(clusterByItemId[a.id]) ?? Number.MAX_SAFE_INTEGER;
+	var clusterB = clusterOrder.get(clusterByItemId[b.id]) ?? Number.MAX_SAFE_INTEGER;
+	if (clusterA !== clusterB) return clusterA - clusterB;
 	if (statusBucket(a) !== statusBucket(b)) return statusBucket(a) === "active" ? -1 : 1;
-	var aScore = (scoreFor(a, "importance") ?? scoreFor(a, "confidence") ?? scoreFor(a, "strength") ?? 0);
-	var bScore = (scoreFor(b, "importance") ?? scoreFor(b, "confidence") ?? scoreFor(b, "strength") ?? 0);
+	var aScore = scoreFor(a, "importance") ?? scoreFor(a, "confidence") ?? scoreFor(a, "strength") ?? 0;
+	var bScore = scoreFor(b, "importance") ?? scoreFor(b, "confidence") ?? scoreFor(b, "strength") ?? 0;
 	if (aScore !== bScore) return bScore - aScore;
 	return titleFor(a).localeCompare(titleFor(b));
 }
 
 function layoutGraph(graph) {
-	var laneWidth = 280;
+	var laneWidth = 290;
 	var laneStart = 90;
-	var rowGap = 94;
-	var clusterGap = 28;
-	var nodeWidth = 184;
-	var nodeHeight = 54;
+	var rowGap = 92;
+	var clusterGap = 34;
+	var nodeWidth = 190;
+	var nodeHeight = 56;
 	var lanes = [[], [], [], [], []];
+	var clusterOrder = new Map(graph.clusters.map((cluster, index) => [cluster.id, index]));
 	graph.items.forEach((item) => lanes[laneFor(item)].push(item));
-	lanes.forEach((laneItems) => laneItems.sort(compareItems));
+	lanes.forEach((laneItems) => laneItems.sort((a, b) => compareItems(a, b, graph.clusterByItemId, clusterOrder)));
 
 	var positions = {};
+	var clusterBounds = {};
+
 	lanes.forEach((laneItems, laneIndex) => {
-		laneItems.forEach((item, rowIndex) => {
-			var clusterOffset = Math.floor(rowIndex / 6) * clusterGap;
-			positions[item.id] = {
-				x: laneStart + laneIndex * laneWidth,
-				y: 70 + rowIndex * rowGap + clusterOffset,
-			};
+		var rowIndex = 0;
+		var previousCluster = "";
+		laneItems.forEach((item) => {
+			var clusterId = graph.clusterByItemId[item.id] || "";
+			if (previousCluster && clusterId !== previousCluster) rowIndex += 1;
+			var x = laneStart + laneIndex * laneWidth;
+			var y = 70 + rowIndex * rowGap;
+			positions[item.id] = { x, y };
+			if (!clusterBounds[clusterId]) {
+				clusterBounds[clusterId] = { minX: x, maxX: x + nodeWidth, minY: y, maxY: y + nodeHeight };
+			} else {
+				clusterBounds[clusterId].minX = Math.min(clusterBounds[clusterId].minX, x);
+				clusterBounds[clusterId].maxX = Math.max(clusterBounds[clusterId].maxX, x + nodeWidth);
+				clusterBounds[clusterId].minY = Math.min(clusterBounds[clusterId].minY, y);
+				clusterBounds[clusterId].maxY = Math.max(clusterBounds[clusterId].maxY, y + nodeHeight);
+			}
+			previousCluster = clusterId;
+			rowIndex += 1;
 		});
 	});
 
 	var contentWidth = laneStart * 2 + laneWidth * lanes.length;
-	var contentHeight = Math.max(460, ...Object.values(positions).map((p) => p.y + nodeHeight + 80), 460);
-	return { positions, laneWidth, nodeWidth, nodeHeight, width: contentWidth, height: contentHeight };
+	var contentHeight = Math.max(460, ...Object.values(positions).map((p) => p.y + nodeHeight + 90), 460);
+	return { positions, clusterBounds, nodeWidth, nodeHeight, width: contentWidth, height: contentHeight };
 }
 
 function nodeStyle(item) {
@@ -294,6 +415,35 @@ function nodeStyle(item) {
 	return { fill: "rgba(74,222,128,0.12)", stroke: "#16a34a", text: "var(--text-strong)", accent: "rgba(74,222,128,0.18)" };
 }
 
+function edgeLabel(edge) {
+	if (edge.kind === "supports") return "supports";
+	if (edge.kind === "contradicts") return "contradicts";
+	if (edge.kind === "checkpoint") return "checkpoint";
+	if (edge.kind === "trait") return "trait support";
+	if (edge.kind === "imagined") return "hypothesis basis";
+	return edge.kind.replaceAll("_", " ");
+}
+
+function hoverStatus(item) {
+	var status = [];
+	if (item.kind === "imagined") status.push("imagined");
+	if (statusBucket(item) === "archived") status.push("archived");
+	if (item.status === "superseded") status.push("superseded");
+	return status.join(" · ") || "active";
+}
+
+function setHoverPreview(item, event) {
+	hoveredPreview.value = {
+		item,
+		x: event.clientX,
+		y: event.clientY,
+	};
+}
+
+function clearHoverPreview() {
+	hoveredPreview.value = null;
+}
+
 function centerOnNode(nodeId, layout, viewportWidth, viewportHeight) {
 	var pos = layout?.positions?.[nodeId];
 	if (!pos) return;
@@ -301,6 +451,29 @@ function centerOnNode(nodeId, layout, viewportWidth, viewportHeight) {
 	var scaledHeight = layout.nodeHeight * graphZoom.value;
 	graphPanX.value = viewportWidth / 2 - (pos.x * graphZoom.value + scaledWidth / 2);
 	graphPanY.value = viewportHeight / 2 - (pos.y * graphZoom.value + scaledHeight / 2);
+}
+
+function HoverPreview() {
+	var hover = hoveredPreview.value;
+	if (!hover?.item) return null;
+	var item = hover.item;
+	var confidence = scoreFor(item, "confidence");
+	var importance = scoreFor(item, "importance");
+	return html`<div
+		class="absolute z-10 max-w-[280px] rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-lg px-3 py-2 pointer-events-none"
+		style=${`left:${Math.min(hover.x + 16, window.innerWidth - 320)}px; top:${Math.max(16, hover.y + 16)}px;`}
+	>
+		<div class="text-sm text-[var(--text-strong)]">${compact(titleFor(item), 52)}</div>
+		<div class="text-xs text-[var(--muted)]">${kindLabel(item)} · ${hoverStatus(item)}</div>
+		<div class="mt-1 text-xs text-[var(--text)]">${compact(summaryFor(item), 120) || item.id}</div>
+		${confidence !== null || importance !== null
+			? html`<div class="mt-1 text-[11px] text-[var(--muted)]">
+				${confidence !== null ? `confidence=${confidence.toFixed(2)}` : ""}
+				${confidence !== null && importance !== null ? " · " : ""}
+				${importance !== null ? `importance=${importance.toFixed(2)}` : ""}
+			</div>`
+			: null}
+	</div>`;
 }
 
 function GraphCanvas() {
@@ -313,6 +486,10 @@ function GraphCanvas() {
 
 	function onNodeSelect(item) {
 		selectedId.value = item.id;
+		var clusterId = graph.clusterByItemId[item.id];
+		if (clusterId && selectedClusterId.value !== "all" && selectedClusterId.value !== clusterId) {
+			selectedClusterId.value = clusterId;
+		}
 		centerOnNode(item.id, layout, viewportWidth, viewportHeight);
 	}
 
@@ -349,7 +526,7 @@ function GraphCanvas() {
 
 	return html`<div class="rounded-lg border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
 		<div class="px-4 py-3 border-b border-[var(--border)] text-sm text-[var(--text-muted)] flex flex-wrap items-center gap-2 justify-between">
-			<div>Developer graph view. Amber is hypothetical. Muted or dashed nodes are archived or superseded.</div>
+			<div>Developer graph view. Cluster tinting groups related items. Amber is hypothetical. Muted or dashed nodes are archived or superseded.</div>
 			<div class="flex items-center gap-2">
 				<button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${() => (graphZoom.value = Math.max(0.55, Number((graphZoom.value - 0.1).toFixed(2))))}>-</button>
 				<div class="min-w-[58px] text-center text-xs text-[var(--muted)]">${Math.round(graphZoom.value * 100)}%</div>
@@ -370,38 +547,88 @@ function GraphCanvas() {
 			onPointerDown=${onPointerDown}
 			onPointerMove=${onPointerMove}
 			onPointerUp=${stopDragging}
-			onPointerLeave=${stopDragging}
+			onPointerLeave=${() => {
+				stopDragging();
+				hoveredEdgeId.value = "";
+				clearHoverPreview();
+			}}
 			style="touch-action:none; cursor:grab;"
 		>
 			<svg viewBox=${`0 0 ${viewportWidth} ${viewportHeight}`} class="w-full h-full">
 				<g transform=${`translate(${graphPanX.value} ${graphPanY.value}) scale(${graphZoom.value})`}>
+					${graph.clusters.map((cluster) => {
+						var bounds = layout.clusterBounds[cluster.id];
+						if (!bounds) return null;
+						return html`<g key=${`cluster-bg:${cluster.id}`}>
+							<rect
+								x=${bounds.minX - 28}
+								y=${bounds.minY - 26}
+								width=${bounds.maxX - bounds.minX + 56}
+								height=${bounds.maxY - bounds.minY + 52}
+								rx="24"
+								ry="24"
+								fill=${cluster.color.fill}
+								stroke=${cluster.color.stroke}
+								stroke-dasharray="4 6"
+								stroke-width="1"
+							/>
+							<text x=${bounds.minX - 18} y=${bounds.minY - 8} font-size="11" fill=${cluster.color.stroke}>
+								${cluster.label}
+							</text>
+						</g>`;
+					})}
 					${graph.edges.map((edge) => {
 						var from = layout.positions[edge.from];
 						var to = layout.positions[edge.to];
 						if (!from || !to) return null;
 						var imagined = edge.kind === "imagined";
 						var isSelectedEdge = edge.from === selectedId.value || edge.to === selectedId.value;
-						return html`<line
-							key=${edge.id}
-							x1=${from.x + layout.nodeWidth / 2}
-							y1=${from.y + layout.nodeHeight / 2}
-							x2=${to.x + layout.nodeWidth / 2}
-							y2=${to.y + layout.nodeHeight / 2}
-							stroke=${imagined ? "rgba(245,158,11,0.9)" : isSelectedEdge ? "rgba(100,116,139,0.9)" : "rgba(113,113,122,0.46)"}
-							stroke-width=${imagined ? "2.1" : isSelectedEdge ? "1.8" : "1.25"}
-							stroke-dasharray=${imagined ? "6 4" : edge.kind === "contradicts" ? "4 4" : ""}
-							opacity=${isSelectedEdge ? "1" : "0.72"}
-						/>`;
+						var showLabel = hoveredEdgeId.value === edge.id || isSelectedEdge;
+						var midX = (from.x + to.x) / 2 + layout.nodeWidth / 2;
+						var midY = (from.y + to.y) / 2 + layout.nodeHeight / 2;
+						return html`<g key=${edge.id}>
+							<line
+								x1=${from.x + layout.nodeWidth / 2}
+								y1=${from.y + layout.nodeHeight / 2}
+								x2=${to.x + layout.nodeWidth / 2}
+								y2=${to.y + layout.nodeHeight / 2}
+								stroke=${imagined ? "rgba(245,158,11,0.9)" : isSelectedEdge ? "rgba(100,116,139,0.9)" : "rgba(113,113,122,0.46)"}
+								stroke-width=${imagined ? "2.1" : isSelectedEdge ? "1.8" : "1.25"}
+								stroke-dasharray=${imagined ? "6 4" : edge.kind === "contradicts" ? "4 4" : ""}
+								opacity=${isSelectedEdge ? "1" : "0.72"}
+								onMouseEnter=${() => (hoveredEdgeId.value = edge.id)}
+								onMouseLeave=${() => (hoveredEdgeId.value = "")}
+							/>
+							${showLabel
+								? html`<g>
+									<rect
+										x=${midX - 38}
+										y=${midY - 10}
+										width="76"
+										height="18"
+										rx="9"
+										ry="9"
+										fill="rgba(15,23,42,0.9)"
+									/>
+									<text x=${midX} y=${midY + 3} text-anchor="middle" font-size="10.5" fill="#f8fafc">
+										${edgeLabel(edge)}
+									</text>
+								</g>`
+								: null}
+						</g>`;
 					})}
 					${graph.items.map((item) => {
 						var pos = layout.positions[item.id];
 						var style = nodeStyle(item);
 						var active = selectedId.value === item.id;
 						var weak = isWeakNode(item);
+						var cluster = graph.clusters.find((entry) => entry.id === graph.clusterByItemId[item.id]);
 						return html`<g
 							key=${item.id}
 							transform=${`translate(${pos.x}, ${pos.y})`}
 							onClick=${() => onNodeSelect(item)}
+							onMouseEnter=${(event) => setHoverPreview(item, event)}
+							onMouseLeave=${clearHoverPreview}
 							style="cursor:pointer;"
 						>
 							${active
@@ -430,17 +657,21 @@ function GraphCanvas() {
 								stroke-dasharray=${statusBucket(item) === "archived" ? "6 4" : ""}
 								opacity=${weak ? "0.7" : "1"}
 							/>
+							${cluster
+								? html`<rect x="0" y="0" width="6" height=${layout.nodeHeight} rx="12" ry="12" fill=${cluster.color.stroke} />`
+								: null}
 							<text x="12" y="18" font-size="10.5" fill="var(--muted)">
 								${kindLabel(item)}${statusBucket(item) === "archived" ? " · archived" : ""}
 							</text>
 							<text x="12" y="35" font-size="12.5" fill=${style.text}>${compact(item.label, 24)}</text>
-							<text x="12" y="48" font-size="10.5" fill="var(--muted)">
+							<text x="12" y="49" font-size="10.5" fill="var(--muted)">
 								${compact(summaryFor(item), 28) || item.id}
 							</text>
 						</g>`;
 					})}
 				</g>
 			</svg>
+			<${HoverPreview} />
 		</div>
 	</div>`;
 }
@@ -555,8 +786,41 @@ function Sidebar() {
 				type="text"
 				placeholder="title, type, or node id"
 				value=${searchQuery.value}
-				onInput=${(e) => (searchQuery.value = e.target.value)}
+				onInput=${(e) => {
+					searchQuery.value = e.target.value;
+					selectedClusterId.value = "all";
+				}}
 			/>
+			<label class="block text-xs text-[var(--muted)] mb-1">Cluster/topic</label>
+			<div class="flex gap-2 mb-3">
+				<select
+					class="flex-1 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm"
+					value=${selectedClusterId.value}
+					onInput=${(e) => (selectedClusterId.value = e.target.value)}
+				>
+					<option value="all">Full graph</option>
+					${graph.allClusters.map(
+						(cluster) => html`<option key=${cluster.id} value=${cluster.id}>
+							${cluster.label} (${cluster.size})
+						</option>`,
+					)}
+				</select>
+				<button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${() => (selectedClusterId.value = "all")}>
+					Full graph
+				</button>
+			</div>
+			<div class="flex flex-wrap gap-1.5 mb-3">
+				${graph.allClusters.slice(0, 8).map(
+					(cluster) => html`<button
+						key=${`chip:${cluster.id}`}
+						class="rounded-full border px-2 py-1 text-[11px]"
+						style=${`border-color:${cluster.color.stroke}; background:${selectedClusterId.value === cluster.id ? cluster.color.chip : "transparent"}; color:var(--text);`}
+						onClick=${() => (selectedClusterId.value = selectedClusterId.value === cluster.id ? "all" : cluster.id)}
+					>
+						${cluster.label}
+					</button>`,
+				)}
+			</div>
 			<label class="block text-xs text-[var(--muted)] mb-1">Node type</label>
 			<select class="w-full mb-3 bg-[var(--bg)] border border-[var(--border)] rounded px-2 py-1.5 text-sm" value=${filterNodeType.value} onInput=${(e) => (filterNodeType.value = e.target.value)}>
 				<option value="all">All verified nodes</option>
@@ -584,7 +848,7 @@ function Sidebar() {
 				Hide weak low-confidence nodes
 			</label>
 			<div class="mt-3 text-xs text-[var(--muted)]">
-				visible items ${graph.items.length} · visible edges ${graph.edges.length}
+				clusters ${graph.allClusters.length} · visible items ${graph.items.length} · visible edges ${graph.edges.length}
 			</div>
 		</div>
 
@@ -617,6 +881,13 @@ function MemoryGraphPage() {
 	useEffect(() => {
 		refreshSnapshot();
 	}, []);
+
+	var graph = visibleGraph(snapshot.value);
+	useEffect(() => {
+		if (selectedClusterId.value !== "all" && !graph.allClusters.some((cluster) => cluster.id === selectedClusterId.value)) {
+			selectedClusterId.value = "all";
+		}
+	}, [graph.allClusters.length, selectedClusterId.value]);
 
 	var item = selectedItem(snapshot.value);
 	useEffect(() => {
@@ -679,7 +950,10 @@ export function teardownMemoryGraph() {
 	neighborhoodOnly.value = false;
 	searchQuery.value = "";
 	hideWeakNodes.value = false;
+	selectedClusterId.value = "all";
 	graphZoom.value = 1;
 	graphPanX.value = 0;
 	graphPanY.value = 0;
+	hoveredPreview.value = null;
+	hoveredEdgeId.value = "";
 }
