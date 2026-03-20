@@ -22,6 +22,8 @@ var graphPanX = signal(0);
 var graphPanY = signal(0);
 var hoveredPreview = signal(null);
 var hoveredEdgeId = signal("");
+var archiveBusy = signal(false);
+var archiveError = signal("");
 var containerRef = null;
 
 var CLUSTER_COLORS = [
@@ -33,10 +35,16 @@ var CLUSTER_COLORS = [
 	{ stroke: "#0891b2", fill: "rgba(8,145,178,0.08)", chip: "rgba(8,145,178,0.12)" },
 ];
 
-async function fetchJson(url) {
+async function fetchJson(url, options) {
+	var request = options || {};
+	var headers = { accept: "application/json", ...(request.headers || {}) };
+	if (request.body && !headers["content-type"]) {
+		headers["content-type"] = "application/json";
+	}
 	var res = await fetch(url, {
-		headers: { accept: "application/json" },
 		credentials: "same-origin",
+		...request,
+		headers,
 	});
 	var data = await res.json().catch(() => ({}));
 	if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
@@ -443,6 +451,37 @@ function setHoverPreview(item, event) {
 
 function clearHoverPreview() {
 	hoveredPreview.value = null;
+}
+
+function canArchiveItem(item) {
+	return Boolean(
+		item &&
+			item.kind === "node" &&
+			item.node_type !== "imagined" &&
+			item.status !== "archived" &&
+			item.status !== "pruned",
+	);
+}
+
+async function archiveSelectedNode(item) {
+	if (!canArchiveItem(item) || archiveBusy.value) return;
+	var reason = window.prompt("Archive reason", "archived from graph ui");
+	if (reason === null) return;
+	archiveBusy.value = true;
+	archiveError.value = "";
+	try {
+		await fetchJson(`/api/nodamem/graph/nodes/${encodeURIComponent(item.id)}/archive`, {
+			method: "POST",
+			body: JSON.stringify({ reason }),
+		});
+		await refreshSnapshot();
+		selectedId.value = item.id;
+		selectedDetail.value = await fetchJson(`/api/nodamem/graph/nodes/${encodeURIComponent(item.id)}`);
+	} catch (err) {
+		archiveError.value = err?.message || "Failed to archive node";
+	} finally {
+		archiveBusy.value = false;
+	}
 }
 
 function centerOnNode(nodeId, layout, viewportWidth, viewportHeight) {
@@ -1039,12 +1078,20 @@ function Sidebar() {
 			<div class="flex items-center justify-between mb-3">
 				<h3 class="text-sm font-medium text-[var(--text-strong)]">Selected Item</h3>
 				${item?.kind === "node"
-					? html`<button class="provider-btn provider-btn-secondary provider-btn-sm" disabled title="No archive action is exposed by the current backend inspection path">
-						Archive unavailable
+					? html`<button
+						class="provider-btn provider-btn-secondary provider-btn-sm"
+						disabled=${archiveBusy.value || !canArchiveItem(item)}
+						title=${canArchiveItem(item)
+							? "Archive this verified node"
+							: "Only active verified nodes can be archived from this view"}
+						onClick=${() => archiveSelectedNode(item)}
+					>
+						${archiveBusy.value ? "Archiving..." : canArchiveItem(item) ? "Archive node" : "Archive unavailable"}
 					</button>`
 					: null}
 			</div>
 			<${SelectionMeta} item=${item} />
+			${archiveError.value ? html`<div class="mt-3 text-xs text-[var(--error)]">${archiveError.value}</div>` : null}
 			${item?.kind === "node"
 				? html`<div class="mt-4">
 					<div class="text-xs uppercase tracking-wide text-[var(--muted)] mb-2">Node actions</div>
@@ -1155,6 +1202,8 @@ export function initMemoryGraph(container) {
 export function teardownMemoryGraph() {
 	if (containerRef) render(null, containerRef);
 	containerRef = null;
+	archiveBusy.value = false;
+	archiveError.value = "";
 	snapshot.value = null;
 	loading.value = false;
 	error.value = "";
