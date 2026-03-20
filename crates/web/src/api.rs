@@ -140,6 +140,37 @@ pub async fn api_nodamem_graph_node_archive_handler(
     }
 }
 
+pub async fn api_nodamem_graph_node_unarchive_handler(
+    Path(node_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ArchiveGraphNodeRequest>,
+) -> impl IntoResponse {
+    let Some(adapter) = state.gateway.nodamem.as_ref() else {
+        return api_error_response(
+            StatusCode::NOT_FOUND,
+            NODAMEM_GRAPH_UNAVAILABLE,
+            "Nodamem adapter is not enabled",
+        );
+    };
+
+    let reason = request
+        .reason
+        .unwrap_or_else(|| "restored from graph ui".to_owned());
+
+    match adapter.unarchive_graph_node_by_id(&node_id, &reason).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("node not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            api_error_response(status, NODAMEM_GRAPH_ARCHIVE_FAILED, message)
+        },
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct SandboxSharedHomeUpdateRequest {
     enabled: bool,
