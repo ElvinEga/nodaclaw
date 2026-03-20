@@ -1035,6 +1035,12 @@ struct PromptPersona {
     memory_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NodamemPromptContext {
+    prompt_context: String,
+    imagined_scenario_ids: Vec<String>,
+}
+
 fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> String {
     let Some(entry) = session_entry else {
         return "main".to_string();
@@ -2811,16 +2817,18 @@ impl LiveChatService {
         session_key: &str,
         text: &str,
         topic: Option<String>,
-    ) -> Option<String> {
+    ) -> Option<NodamemPromptContext> {
         let Some(adapter) = self.state.nodamem() else {
             debug!(session = %session_key, "nodamem unavailable; using fallback memory path");
             return None;
         };
+        let include_hypothetical = should_request_nodamem_imagination(text, topic.as_deref());
         match adapter
             .recall_context(&NodamemRecallRequest {
                 text: text.to_owned(),
                 session_id: Some(session_key.to_owned()),
                 topic,
+                include_hypothetical,
             })
             .await
         {
@@ -2836,9 +2844,14 @@ impl LiveChatService {
                     lesson_count = result.packet.lessons.len(),
                     checkpoint_count = result.packet.checkpoints.len(),
                     trait_count = result.packet.traits.len(),
+                    hypothetical_requested = include_hypothetical,
+                    imagined_scenario_count = result.imagined_scenario_ids.len(),
                     "nodamem context injected into prompt"
                 );
-                Some(result.prompt_context)
+                Some(NodamemPromptContext {
+                    prompt_context: result.prompt_context,
+                    imagined_scenario_ids: result.imagined_scenario_ids,
+                })
             },
             Ok(None) => {
                 debug!(session = %session_key, "nodamem returned no context; using fallback memory path");
@@ -2850,6 +2863,40 @@ impl LiveChatService {
             },
         }
     }
+}
+
+fn should_request_nodamem_imagination(text: &str, topic: Option<&str>) -> bool {
+    let lower = text.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let topic_match = topic
+        .map(|value| value.trim().to_lowercase())
+        .is_some_and(|value| {
+            ["planning", "brainstorm", "strategy", "future"]
+                .iter()
+                .any(|needle| value.contains(needle))
+        });
+    topic_match
+        || [
+            "plan",
+            "planning",
+            "brainstorm",
+            "brainstorming",
+            "future",
+            "next step",
+            "next steps",
+            "roadmap",
+            "strategy",
+            "options",
+            "alternative",
+            "what if",
+            "could we",
+            "should we",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 fn merge_prompt_contexts(
@@ -2910,6 +2957,7 @@ async fn maybe_record_outcome_feedback(
     session_key: &str,
     success: bool,
     user_accepted: bool,
+    imagined_scenario_ids: &[String],
 ) {
     let Some(adapter) = runtime.nodamem() else {
         debug!(session = %session_key, "nodamem unavailable; skipping record_outcome");
@@ -2948,6 +2996,36 @@ async fn maybe_record_outcome_feedback(
         },
         Err(error) => {
             warn!(session = %session_key, %error, "nodamem record_outcome failed");
+        },
+    }
+
+    if imagined_scenario_ids.is_empty() {
+        return;
+    }
+
+    debug!(
+        session = %session_key,
+        accepted = success && user_accepted,
+        imagined_scenario_count = imagined_scenario_ids.len(),
+        "nodamem imagined scenario review requested"
+    );
+    match adapter
+        .review_imagined_scenarios(&moltis_nodamem_adapter::ImaginedScenarioFeedbackRequest {
+            scenario_ids: imagined_scenario_ids.to_vec(),
+            accepted: success && user_accepted,
+        })
+        .await
+    {
+        Ok(result) => {
+            debug!(
+                session = %session_key,
+                reviewed_count = result.reviewed_count,
+                missing_count = result.missing_count,
+                "nodamem imagined scenario review completed"
+            );
+        },
+        Err(error) => {
+            warn!(session = %session_key, %error, "nodamem imagined scenario review failed");
         },
     }
 }
@@ -3474,11 +3552,17 @@ impl ChatService for LiveChatService {
         }
 
         // Resolve project context for this connection's active project.
+        let nodamem_context = self
+            .resolve_nodamem_context(&session_key, &text, None)
+            .await;
+        let nodamem_scenario_ids = nodamem_context
+            .as_ref()
+            .map(|context| context.imagined_scenario_ids.clone())
+            .unwrap_or_default();
         let project_context = merge_prompt_contexts(
             self.resolve_project_context(&session_key, conn_id.as_deref())
                 .await,
-            self.resolve_nodamem_context(&session_key, &text, None)
-                .await,
+            nodamem_context.map(|context| context.prompt_context),
         );
 
         // Dispatch MessageReceived hook (read-only).
@@ -3988,9 +4072,23 @@ impl ChatService for LiveChatService {
                     &assistant_text_for_nodamem,
                 )
                 .await;
-                maybe_record_outcome_feedback(&state, &session_key_clone, true, true).await;
+                maybe_record_outcome_feedback(
+                    &state,
+                    &session_key_clone,
+                    true,
+                    true,
+                    &nodamem_scenario_ids,
+                )
+                .await;
             } else {
-                maybe_record_outcome_feedback(&state, &session_key_clone, false, false).await;
+                maybe_record_outcome_feedback(
+                    &state,
+                    &session_key_clone,
+                    false,
+                    false,
+                    &nodamem_scenario_ids,
+                )
+                .await;
             }
 
             let _ = LiveChatService::wait_for_event_forwarder(
@@ -4204,9 +4302,14 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
-        let prompt_context = self
+        let nodamem_context = self
             .resolve_nodamem_context(&session_key, &text, None)
             .await;
+        let nodamem_scenario_ids = nodamem_context
+            .as_ref()
+            .map(|context| context.imagined_scenario_ids.clone())
+            .unwrap_or_default();
+        let prompt_context = nodamem_context.map(|context| context.prompt_context);
         let active_event_forwarders = Arc::new(RwLock::new(HashMap::new()));
         let terminal_runs = Arc::new(RwLock::new(HashSet::new()));
         let result = if stream_only {
@@ -4298,9 +4401,17 @@ impl ChatService for LiveChatService {
 
             maybe_propose_exchange_memory(&state, &session_key, &text, &assistant_output.text)
                 .await;
-            maybe_record_outcome_feedback(&state, &session_key, true, true).await;
+            maybe_record_outcome_feedback(&state, &session_key, true, true, &nodamem_scenario_ids)
+                .await;
         } else {
-            maybe_record_outcome_feedback(&state, &session_key, false, false).await;
+            maybe_record_outcome_feedback(
+                &state,
+                &session_key,
+                false,
+                false,
+                &nodamem_scenario_ids,
+            )
+            .await;
         }
 
         match result {
@@ -4962,10 +5073,8 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = merge_prompt_contexts(
-            self.resolve_project_context(&session_key, conn_id.as_deref())
-                .await,
-            self.resolve_nodamem_context(
+        let nodamem_context = self
+            .resolve_nodamem_context(
                 &session_key,
                 history
                     .last()
@@ -4973,7 +5082,11 @@ impl ChatService for LiveChatService {
                     .unwrap_or(""),
                 None,
             )
-            .await,
+            .await;
+        let project_context = merge_prompt_contexts(
+            self.resolve_project_context(&session_key, conn_id.as_deref())
+                .await,
+            nodamem_context.map(|context| context.prompt_context),
         );
 
         // Discover skills.
@@ -5095,10 +5208,8 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = merge_prompt_contexts(
-            self.resolve_project_context(&session_key, conn_id.as_deref())
-                .await,
-            self.resolve_nodamem_context(
+        let nodamem_context = self
+            .resolve_nodamem_context(
                 &session_key,
                 history
                     .last()
@@ -5106,7 +5217,11 @@ impl ChatService for LiveChatService {
                     .unwrap_or(""),
                 None,
             )
-            .await,
+            .await;
+        let project_context = merge_prompt_contexts(
+            self.resolve_project_context(&session_key, conn_id.as_deref())
+                .await,
+            nodamem_context.map(|context| context.prompt_context),
         );
 
         // Discover skills.
@@ -12280,5 +12395,25 @@ mod tests {
             mode: Some(ToolMode::Auto),
         };
         assert_eq!(effective_tool_mode(&text), ToolMode::Text);
+    }
+
+    #[test]
+    fn nodamem_imagination_policy_only_enables_future_or_planning_queries() {
+        assert!(should_request_nodamem_imagination(
+            "Brainstorm two rollout options for next week",
+            None
+        ));
+        assert!(should_request_nodamem_imagination(
+            "Summarize likely risks for the next release",
+            Some("planning")
+        ));
+        assert!(!should_request_nodamem_imagination(
+            "What preference did the user mention earlier?",
+            None
+        ));
+        assert!(!should_request_nodamem_imagination(
+            "Recall the deployment window we already agreed on",
+            Some("memory")
+        ));
     }
 }

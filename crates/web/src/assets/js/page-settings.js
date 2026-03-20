@@ -19,6 +19,7 @@ import { initHooks, teardownHooks } from "./page-hooks.js";
 import { initImages, teardownImages } from "./page-images.js";
 import { initLogs, teardownLogs } from "./page-logs.js";
 import { initMcp, teardownMcp } from "./page-mcp.js";
+import { initMemoryGraph, teardownMemoryGraph } from "./page-memory-graph.js";
 import { initMonitoring, teardownMonitoring } from "./page-metrics.js";
 import { initNetworkAudit, teardownNetworkAudit } from "./page-network-audit.js";
 import { initNodes, teardownNodes } from "./page-nodes.js";
@@ -128,6 +129,12 @@ var sections = [
 		id: "memory",
 		label: "Memory",
 		icon: html`<span class="icon icon-database"></span>`,
+	},
+	{
+		id: "nodamem-graph",
+		label: "Nodamem Graph",
+		icon: html`<span class="icon icon-database"></span>`,
+		page: true,
 	},
 	{
 		id: "notifications",
@@ -3945,6 +3952,7 @@ var pageSectionHandlers = {
 	providers: { init: initProviders, teardown: teardownProviders },
 	channels: { init: initChannels, teardown: teardownChannels },
 	mcp: { init: initMcp, teardown: teardownMcp },
+	"nodamem-graph": { init: initMemoryGraph, teardown: teardownMemoryGraph },
 	nodes: { init: initNodes, teardown: teardownNodes },
 	hooks: { init: initHooks, teardown: teardownHooks },
 	skills: { init: initSkills, teardown: teardownSkills },
