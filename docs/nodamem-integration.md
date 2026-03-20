@@ -73,3 +73,5 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - Verified memory stays green or blue, imagined scenarios stay amber, and archived or superseded records remain muted with dashed outlines.
 - Use the cluster/topic selector or the cluster chips to isolate one connected topic at a time, then use `Full graph` to return to the complete snapshot.
 - Hover a node to get a compact preview of title, type, summary, scores, and status; hover an edge or select a node to reveal edge labels without permanently cluttering the graph.
+- Selecting a verified node opens node actions for provenance, lesson links, supersession history, and same-cluster neighbor jumps.
+- Provenance stays compact: it uses the existing inspection detail for source event ids, related nodes, audit reasons, lesson links, and any directly linked trait influence; imagined scenarios keep their own separate hypothetical view.
