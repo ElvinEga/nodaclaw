@@ -16,6 +16,7 @@ var neighborhoodOnly = signal(false);
 var searchQuery = signal("");
 var hideWeakNodes = signal(false);
 var selectedClusterId = signal("all");
+var selectedNodePanel = signal("provenance");
 var graphZoom = signal(1);
 var graphPanX = signal(0);
 var graphPanY = signal(0);
@@ -760,6 +761,188 @@ function selectedItem(data) {
 	return items.find((item) => item.id === selectedId.value) || null;
 }
 
+function normalizedText(value) {
+	return String(value || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9\s]/g, " ")
+		.trim();
+}
+
+function keywordSet(item) {
+	return new Set(
+		normalizedText(`${titleFor(item)} ${summaryFor(item)}`)
+			.split(/\s+/)
+			.filter((part) => part.length >= 4),
+	);
+}
+
+function sameTopicHistory(currentItem, historyItems) {
+	if (!currentItem || currentItem.kind !== "node") return [];
+	var currentWords = keywordSet(currentItem);
+	return (historyItems || []).filter((candidate) => {
+		if (candidate.id === currentItem.id) return false;
+		if (candidate.node_type !== currentItem.node_type) return false;
+		var candidateWords = keywordSet(candidate);
+		var overlap = 0;
+		currentWords.forEach((word) => {
+			if (candidateWords.has(word)) overlap += 1;
+		});
+		return overlap > 0;
+	});
+}
+
+function supportingTraitsForNode(data, detail) {
+	if (!detail?.node?.id) return [];
+	var lessonIds = new Set((detail.lesson_links || []).map((link) => link.lesson_id));
+	return (data?.traits || []).filter((trait) => {
+		var nodeMatch = (trait.supporting_node_ids || []).includes(detail.node.id);
+		var lessonMatch = (trait.supporting_lesson_ids || []).some((lessonId) => lessonIds.has(String(lessonId)));
+		return nodeMatch || lessonMatch;
+	});
+}
+
+function nodeStateSummary(detail) {
+	var reasons = detail?.reasons || [];
+	var states = [];
+	if (reasons.some((reason) => /reinforc/i.test(reason))) states.push("reinforced");
+	if (reasons.some((reason) => /refin/i.test(reason))) states.push("refined");
+	if (reasons.some((reason) => /weaken|contradict/i.test(reason))) states.push("weakened");
+	if (reasons.some((reason) => /supersed/i.test(reason))) states.push("superseded");
+	return states.length ? states.join(" · ") : "no recent state change noted";
+}
+
+function neighboringClusterNodes(graph, detail) {
+	if (!detail?.node?.id) return [];
+	var selectedCluster = graph.clusterByItemId[detail.node.id];
+	if (!selectedCluster) return [];
+	var relatedIds = new Set((detail.related_nodes || []).map((node) => node.node_id));
+	return graph.items.filter((item) => {
+		if (item.id === detail.node.id) return false;
+		if (!relatedIds.has(item.id)) return false;
+		return graph.clusterByItemId[item.id] === selectedCluster;
+	});
+}
+
+function NodeActionPanel({ item, graph, data }) {
+	if (!item) return html`<div class="text-sm text-[var(--muted)]">Select a node to inspect actions.</div>`;
+	if (item.kind === "imagined") {
+		return html`<div class="space-y-2 text-sm">
+			<div class="text-[var(--text-strong)]">Hypothetical scenario</div>
+			<div class="text-[var(--muted)]">
+				Imagined content stays separate from verified provenance. Review its basis nodes in the graph and use the main details card for scenario context.
+			</div>
+			<div class="text-xs text-[var(--muted)]">basis nodes: ${(item.basis_source_node_ids || []).slice(0, 5).join(", ") || "none"}</div>
+		</div>`;
+	}
+	if (item.kind !== "node") {
+		return html`<div class="text-sm text-[var(--muted)]">Node actions are available for verified memory nodes.</div>`;
+	}
+	if (detailLoading.value) return html`<div class="text-sm text-[var(--muted)]">Loading node actions...</div>`;
+	if (!selectedDetail.value) return html`<div class="text-sm text-[var(--muted)]">Node detail is unavailable for actions.</div>`;
+
+	var detail = selectedDetail.value;
+	var traits = supportingTraitsForNode(data, detail);
+	var sameClusterNodes = neighboringClusterNodes(graph, detail);
+	var superseded = sameTopicHistory(item, data?.superseded_history || []);
+
+	if (selectedNodePanel.value === "lessons") {
+		return html`<div class="space-y-2 text-sm">
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)]">Related lesson history</div>
+			${detail.lesson_links?.length
+				? detail.lesson_links.map(
+						(link) => html`<div class="rounded bg-[var(--surface2)] px-3 py-2 text-xs text-[var(--text)]">
+							<div class="text-[var(--muted)]">${link.relation}</div>
+							<div>${compact(link.title, 80)}</div>
+						</div>`,
+					)
+				: html`<div class="text-xs text-[var(--muted)]">No supporting or contradicting lessons linked to this node.</div>`}
+		</div>`;
+	}
+
+	if (selectedNodePanel.value === "history") {
+		return html`<div class="space-y-2 text-sm">
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)]">Supersession history</div>
+			<div class="text-xs text-[var(--muted)]">${nodeStateSummary(detail)}</div>
+			${superseded.length
+				? superseded.map(
+						(node) => html`<button
+							key=${`superseded:${node.id}`}
+							class="w-full text-left rounded border border-[var(--border)] bg-[var(--surface2)] px-3 py-2"
+							onClick=${() => (selectedId.value = node.id)}
+						>
+							<div class="text-xs text-[var(--muted)]">${node.node_type} · archived</div>
+							<div class="text-sm text-[var(--text)]">${compact(titleFor(node), 72)}</div>
+						</button>`,
+					)
+				: html`<div class="text-xs text-[var(--muted)]">No same-topic superseded history was found in the current snapshot.</div>`}
+		</div>`;
+	}
+
+	if (selectedNodePanel.value === "neighbors") {
+		return html`<div class="space-y-2 text-sm">
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)]">Neighbor jump</div>
+			<div class="text-xs text-[var(--muted)]">Jump to nearby nodes that remain in the same current cluster/topic.</div>
+			${sameClusterNodes.length
+				? sameClusterNodes.slice(0, 8).map(
+						(node) => html`<button
+							key=${`neighbor:${node.id}`}
+							class="w-full text-left rounded border border-[var(--border)] bg-[var(--surface2)] px-3 py-2"
+							onClick=${() => {
+								selectedClusterId.value = graph.clusterByItemId[node.id] || "all";
+								selectedId.value = node.id;
+							}}
+						>
+							<div class="text-xs text-[var(--muted)]">${kindLabel(node)}</div>
+							<div class="text-sm text-[var(--text)]">${compact(titleFor(node), 72)}</div>
+						</button>`,
+					)
+				: html`<div class="text-xs text-[var(--muted)]">No same-cluster neighbor candidates are available for this node.</div>`}
+		</div>`;
+	}
+
+	return html`<div class="space-y-3 text-sm">
+		<div class="text-xs uppercase tracking-wide text-[var(--muted)]">Provenance and evidence</div>
+		<div class="text-xs text-[var(--muted)]">state: ${nodeStateSummary(detail)}</div>
+		<div>
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)] mb-1">Source nodes</div>
+			${detail.related_nodes?.length
+				? detail.related_nodes.slice(0, 5).map(
+						(node) => html`<button
+							key=${`source:${node.node_id}`}
+							class="w-full text-left rounded bg-[var(--surface2)] px-3 py-2 text-xs text-[var(--text)] mb-1"
+							onClick=${() => (selectedId.value = node.node_id)}
+						>
+							${compact(node.title, 72)} (${node.node_type})
+						</button>`,
+					)
+				: html`<div class="text-xs text-[var(--muted)]">No neighboring source nodes recorded.</div>`}
+		</div>
+		<div>
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)] mb-1">Supporting lessons</div>
+			${detail.lesson_links?.length
+				? detail.lesson_links.slice(0, 4).map(
+						(link) => html`<div class="rounded bg-[var(--surface2)] px-3 py-2 text-xs text-[var(--text)] mb-1">
+							${link.relation}: ${compact(link.title, 74)}
+						</div>`,
+					)
+				: html`<div class="text-xs text-[var(--muted)]">No supporting lessons linked.</div>`}
+		</div>
+		<div>
+			<div class="text-xs uppercase tracking-wide text-[var(--muted)] mb-1">Trait or self-model influence</div>
+			${traits.length
+				? traits.slice(0, 3).map(
+						(trait) => html`<div class="rounded bg-[var(--surface2)] px-3 py-2 text-xs text-[var(--text)] mb-1">
+							${trait.label} (${Number(trait.strength || 0).toFixed(2)})
+						</div>`,
+					)
+				: detail.reasons.some((reason) => /self-model/i.test(reason))
+					? html`<div class="text-xs text-[var(--text)]">Recent self-model influence was mentioned in audit reasons.</div>`
+					: html`<div class="text-xs text-[var(--muted)]">No direct trait or self-model influence is linked in the current inspection payload.</div>`}
+		</div>
+		<div class="text-xs text-[var(--muted)]">source event: ${detail.source_event_id || "none"}</div>
+	</div>`;
+}
+
 function Sidebar() {
 	var data = snapshot.value;
 	var graph = visibleGraph(data);
@@ -853,8 +1036,38 @@ function Sidebar() {
 		</div>
 
 		<div class="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4">
-			<h3 class="text-sm font-medium text-[var(--text-strong)] mb-3">Selected Item</h3>
+			<div class="flex items-center justify-between mb-3">
+				<h3 class="text-sm font-medium text-[var(--text-strong)]">Selected Item</h3>
+				${item?.kind === "node"
+					? html`<button class="provider-btn provider-btn-secondary provider-btn-sm" disabled title="No archive action is exposed by the current backend inspection path">
+						Archive unavailable
+					</button>`
+					: null}
+			</div>
 			<${SelectionMeta} item=${item} />
+			${item?.kind === "node"
+				? html`<div class="mt-4">
+					<div class="text-xs uppercase tracking-wide text-[var(--muted)] mb-2">Node actions</div>
+					<div class="flex flex-wrap gap-1.5 mb-3">
+						${[
+							["provenance", "Provenance"],
+							["lessons", "Lessons"],
+							["history", "History"],
+							["neighbors", "Neighbors"],
+						].map(
+							([value, label]) => html`<button
+								key=${`panel:${value}`}
+								class="rounded-full border px-2 py-1 text-[11px]"
+								style=${`border-color:var(--border); background:${selectedNodePanel.value === value ? "var(--surface2)" : "transparent"}; color:var(--text);`}
+								onClick=${() => (selectedNodePanel.value = value)}
+							>
+								${label}
+							</button>`,
+						)}
+					</div>
+					<${NodeActionPanel} item=${item} graph=${graph} data=${data} />
+				</div>`
+				: null}
 		</div>
 
 		<div class="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4">
@@ -890,6 +1103,10 @@ function MemoryGraphPage() {
 	}, [graph.allClusters.length, selectedClusterId.value]);
 
 	var item = selectedItem(snapshot.value);
+	useEffect(() => {
+		selectedNodePanel.value = "provenance";
+	}, [selectedId.value]);
+
 	useEffect(() => {
 		if (!item || item.kind !== "node") {
 			selectedDetail.value = null;
@@ -951,6 +1168,7 @@ export function teardownMemoryGraph() {
 	searchQuery.value = "";
 	hideWeakNodes.value = false;
 	selectedClusterId.value = "all";
+	selectedNodePanel.value = "provenance";
 	graphZoom.value = 1;
 	graphPanX.value = 0;
 	graphPanY.value = 0;
