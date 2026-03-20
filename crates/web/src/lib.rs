@@ -156,6 +156,10 @@ fn build_api_routes() -> Router<AppState> {
             axum::routing::post(api::api_nodamem_graph_node_archive_handler),
         )
         .route(
+            "/api/nodamem/graph/nodes/{node_id}/unarchive",
+            axum::routing::post(api::api_nodamem_graph_node_unarchive_handler),
+        )
+        .route(
             "/api/sessions/{session_key}/history",
             get(api::api_session_history_handler),
         )
