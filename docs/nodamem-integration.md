@@ -76,3 +76,4 @@ Run the gateway with debug logging enabled and watch for the compact Nodamem tra
 - Selecting a verified node opens node actions for provenance, lesson links, supersession history, and same-cluster neighbor jumps.
 - Provenance stays compact: it uses the existing inspection detail for source event ids, related nodes, audit reasons, lesson links, and any directly linked trait influence; imagined scenarios keep their own separate hypothetical view.
 - Eligible verified nodes can now be archived from the selected-item card. The action records an append-only archive event with the provided reason, leaves the node inspectable in the graph, and keeps archived preference or goal nodes visible in history views.
+- Archived verified nodes can be restored from the same selected-item card. Archive and restore both append reasoned node-action events, and the selected node timeline shows created plus notable derived or explicit events such as archived and unarchived.
